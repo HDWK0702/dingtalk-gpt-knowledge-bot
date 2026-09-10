@@ -7,7 +7,7 @@ import time
 from dotenv import load_dotenv
 from dingtalk_stream import AckMessage, CallbackMessage, ChatbotHandler, ChatbotMessage
 from dingtalk_stream import Credential, DingTalkStreamClient
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 try:
     import redis
@@ -94,6 +94,9 @@ def answer_question(question: str, department: str | None = None) -> str:
             )
             answer = response.output_text.strip()
             return answer or "知识库暂未生成可核实的答案。请联系知识库管理员。"
+        except RateLimitError:
+            logger.warning("LLM provider is rate limited")
+            return "AI 回复服务当前繁忙，请稍后再试。"
         except Exception as exc:
             last_error = exc
             if attempt < 2:
@@ -110,10 +113,10 @@ class KnowledgeBotHandler(ChatbotHandler):
             return AckMessage.STATUS_OK, "OK"
 
         if not question:
-            await self.reply_text("请在 @我 后输入具体问题。", incoming)
+            self.reply_text("请在 @我 后输入具体问题。", incoming)
             return AckMessage.STATUS_OK, "OK"
         if len(question) > MAX_QUESTION_LENGTH:
-            await self.reply_text(f"问题过长，请控制在 {MAX_QUESTION_LENGTH} 字以内。", incoming)
+            self.reply_text(f"问题过长，请控制在 {MAX_QUESTION_LENGTH} 字以内。", incoming)
             return AckMessage.STATUS_OK, "OK"
 
         # Acknowledge the Stream callback before the model call. A slow model
@@ -129,7 +132,7 @@ class KnowledgeBotHandler(ChatbotHandler):
             logger.exception("Failed to answer a DingTalk message")
             reply = "暂时无法生成回答，请稍后重试。"
 
-        await self.reply_text(reply, incoming)
+        self.reply_text(reply, incoming)
 
 
 def main() -> None:
