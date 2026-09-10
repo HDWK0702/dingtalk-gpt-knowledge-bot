@@ -27,8 +27,11 @@ SYSTEM_PROMPT = f"""You are an enterprise knowledge assistant.
 Answer only from the approved knowledge excerpts supplied below. The excerpts
 were retrieved as relevant, so answer directly when they contain facts that
 reasonably answer the employee's question, even when the wording differs.
-If the excerpts do not contain enough facts, reply with this exact sentence and
-nothing else: '{NO_ANSWER}'
+If excerpts contain some relevant facts but do not fully answer the question,
+state only the confirmed facts first, then clearly say which detail is not
+covered and should be confirmed with a human. Do not use the no-answer sentence
+in this case. Use this exact sentence only when no excerpt contains any fact
+related to the question: '{NO_ANSWER}'
 Use concise Chinese. Do not write sources, citations, URLs, or a 来源 heading.
 Never invent a source or policy."""
 
@@ -86,10 +89,32 @@ def format_sources(chunks: list[KnowledgeChunk]) -> str:
     return "### 来源\n" + "\n".join(sources)
 
 
+def format_related_material(chunks: list[KnowledgeChunk]) -> str:
+    """Show source-only excerpts when the model cannot form a direct answer."""
+    preview_limit = int(os.getenv("RAG_RELATED_PREVIEW_CHARS", "360"))
+    seen: set[tuple[str, str]] = set()
+    sections: list[str] = []
+    for chunk in chunks:
+        identity = (chunk.title, chunk.url)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        preview = re.sub(r"\s+", " ", chunk.content).strip()
+        if len(preview) > preview_limit:
+            preview = f"{preview[:preview_limit].rstrip()}..."
+        sections.append(f"#### 《{chunk.title}》\n{preview}\n{chunk.url}")
+        if len(sections) == 2:
+            break
+    return (
+        "当前资料没有直接回答该问题，但以下内容可能相关，具体情况请联系顾问确认。\n\n"
+        + "\n\n".join(sections)
+    )
+
+
 def finalize_answer(answer: str, chunks: list[KnowledgeChunk]) -> str:
-    """Keep refusal responses clean and add traceable sources to normal answers."""
+    """Add sources to answers and surface useful excerpts for partial matches."""
     if NO_ANSWER in answer:
-        return NO_ANSWER
+        return format_related_material(chunks)
     answer_without_model_sources = re.split(r"\n\s*\\?#{1,6}\s*来源\b", answer, maxsplit=1)[0].strip()
     if not answer_without_model_sources:
         return "知识库暂未生成可核实的答案。请联系知识库管理员。"
