@@ -47,6 +47,18 @@ review_date: 2026-12-31
 ---
 ```
 
+## Semantic retrieval
+
+The bot can use a local vector index generated from approved Obsidian Markdown.
+Configure `EMBEDDING_API_KEY`, `EMBEDDING_BASE_URL`,
+`OPENAI_EMBEDDING_MODEL`, and `RAG_RETRIEVAL_MODE=embedding` in `.env`, then
+build the index:
+
+`uv run --python .venv python index_knowledge.py`
+
+Run the command again whenever an approved source document changes. The local
+`rag_index.json` file is generated data and is intentionally not committed to Git.
+
 ## Production notes
 
 - Use RDS PostgreSQL + pgvector and OSS for production persistence; the current
