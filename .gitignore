@@ -4,3 +4,13 @@ __pycache__/
 .venv/
 *.log
 rag_index.json
+data/chunks-preview/
+data/load-tests/
+data/qa_logs.jsonl
+data/qa_logs.md
+data/performance_logs.jsonl
+data/performance_logs.md
+data/*.jsonl
+data/*.md
+.idea/
+.vscode/

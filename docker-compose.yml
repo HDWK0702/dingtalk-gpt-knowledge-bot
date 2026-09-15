@@ -1,21 +1,49 @@
 services:
   bot:
     build: .
+    image: dingtalk-gpt-knowledge-bot:local
     env_file: .env
+    environment:
+      # Container paths deliberately differ from the host Windows paths in .env.
+      OBSIDIAN_VAULT_PATH: /data/knowledge
+      RAG_INDEX_PATH: /app/data/rag/rag_index.json
+      QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
     restart: unless-stopped
     volumes:
-      - ${OBSIDIAN_VAULT_PATH:-./knowledge}:/data/knowledge:ro
+      - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
+      - rag_data:/app/data/rag
+      - app_data:/app/data/logs
     depends_on:
       - redis
   api:
     build: .
+    image: dingtalk-gpt-knowledge-bot:local
     command: uvicorn api:app --host 0.0.0.0 --port 8000
     env_file: .env
+    environment:
+      OBSIDIAN_VAULT_PATH: /data/knowledge
+      RAG_INDEX_PATH: /app/data/rag/rag_index.json
+      QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
     restart: unless-stopped
     volumes:
-      - ${OBSIDIAN_VAULT_PATH:-./knowledge}:/data/knowledge:ro
+      - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
+      - rag_data:/app/data/rag
+      - app_data:/app/data/logs
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8000}:8000"
+  indexer:
+    build: .
+    image: dingtalk-gpt-knowledge-bot:local
+    command: python index_knowledge.py
+    env_file: .env
+    environment:
+      OBSIDIAN_VAULT_PATH: /data/knowledge
+      RAG_INDEX_PATH: /app/data/rag/rag_index.json
+    volumes:
+      - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
+      - rag_data:/app/data/rag
+    profiles:
+      - tools
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -24,3 +52,5 @@ services:
 
 volumes:
   redis_data:
+  rag_data:
+  app_data:
