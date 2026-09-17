@@ -9,7 +9,8 @@ services:
       RAG_INDEX_PATH: /app/data/rag/rag_index.json
       QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
       RAG_STORAGE: ${RAG_STORAGE:-postgres}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://knowledge:change_me_local_only@postgres:5432/knowledge}
+      # Containers reach PostgreSQL through its Docker service name, not Windows localhost.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-knowledge}:${POSTGRES_PASSWORD:-change_me_local_only}@postgres:5432/${POSTGRES_DB:-knowledge}
     restart: unless-stopped
     volumes:
       - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
@@ -30,7 +31,7 @@ services:
       RAG_INDEX_PATH: /app/data/rag/rag_index.json
       QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
       RAG_STORAGE: ${RAG_STORAGE:-postgres}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://knowledge:change_me_local_only@postgres:5432/knowledge}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-knowledge}:${POSTGRES_PASSWORD:-change_me_local_only}@postgres:5432/${POSTGRES_DB:-knowledge}
     restart: unless-stopped
     volumes:
       - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
@@ -52,7 +53,7 @@ services:
       OBSIDIAN_VAULT_PATH: /data/knowledge
       RAG_INDEX_PATH: /app/data/rag/rag_index.json
       RAG_STORAGE: ${RAG_STORAGE:-postgres}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://knowledge:change_me_local_only@postgres:5432/knowledge}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-knowledge}:${POSTGRES_PASSWORD:-change_me_local_only}@postgres:5432/${POSTGRES_DB:-knowledge}
     volumes:
       - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
       - rag_data:/app/data/rag
