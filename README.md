@@ -202,6 +202,23 @@ build the index:
 Run the command again whenever an approved source document changes. The local
 `rag_index.json` file is generated data and is intentionally not committed to Git.
 
+### Chat-model load balancing
+
+When both `PRIMARY_LLM_*` (or legacy `OPENAI_*`) and `FALLBACK_LLM_*` routes are
+configured, normal requests can be distributed between them:
+
+```text
+LLM_LOAD_BALANCE_ENABLED=true
+PRIMARY_LLM_WEIGHT=70
+FALLBACK_LLM_WEIGHT=30
+```
+
+The weights are relative shares, so `70/30` sends about seven of every ten
+requests to the primary route and three to the fallback route. Each request
+uses only one route normally. If that selected route times out, is rate-limited,
+loses its connection, or returns a server error, the other route is attempted.
+Set `LLM_LOAD_BALANCE_ENABLED=false` to restore primary-first failover behavior.
+
 ## Production notes
 
 - Use RDS PostgreSQL + pgvector and OSS for production persistence; the current

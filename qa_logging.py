@@ -99,7 +99,9 @@ def append_performance(**fields: Any) -> str:
         f"- 检索合计：{record.get('retrieval_seconds', 0)} 秒",
         f"- 大模型生成：{record.get('llm_generation_seconds', 0)} 秒",
         f"- 总耗时：{record.get('total_seconds', 0)} 秒",
-        f"- 模型线路：{record.get('llm_route', '')}",
+        f"- 初始模型线路：{record.get('initial_llm_route', '')}",
+        f"- 最终模型线路：{record.get('llm_route', '')}",
+        f"- 是否故障切换：{'是' if record.get('failover_used') else '否'}",
         "",
     ]
     # 与问答日志共用锁，防止并发任务的性能记录互相穿插。

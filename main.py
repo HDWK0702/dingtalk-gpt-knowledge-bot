@@ -3,7 +3,9 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 
@@ -54,8 +56,11 @@ _latest_question_by_sender: dict[str, str] = {}
 _pending_domain_questions: dict[str, tuple[str, float]] = {}
 PENDING_DOMAIN_TTL_SECONDS = 300
 _conversation_history: dict[str, list[dict[str, str | float]]] = {}
+_sender_answer_tasks: dict[str, asyncio.Task[None]] = {}
 CONVERSATION_HISTORY_TURNS = 3
 CONVERSATION_HISTORY_TTL_SECONDS = 900
+_llm_balance_lock = threading.Lock()
+_llm_balance_accumulator = 0.0
 
 # 第一层业务分流：员工可直接输入“产品：……”或“培训：……”，快速指定要查询的资料库。
 QUESTION_DOMAIN_PREFIXES = {
@@ -78,13 +83,20 @@ TRAINING_DOMAIN_KEYWORDS = (
     "医疗器械", "医疗器械经营", "三类医疗", "许可证", "备案",
 )
 # 关键词也无法判断时，机器人先追问业务范围；上下文模型提示词则用于理解“那它需要什么材料”等追问。
-DOMAIN_PROMPT = "您是要咨询法律服务，还是公司注册，资质办理之类的服务？"
-CONTEXT_ROUTER_PROMPT = """You are a routing classifier for a Chinese enterprise knowledge bot.
-Return only one JSON object: {"related": true|false, "domain": "product"|"training"|"unknown"}.
-related is true only if the current question depends on the supplied recent conversation.
-If related is true, domain must equal the domain of the most recent conversation.
-If related is false, classify the current question independently: product means 财法通 product/service information; training means internal business training such as registration, accounting, tax, licenses, and cancellation.
-Use unknown only when neither domain can be determined. Do not answer the business question."""
+DOMAIN_PROMPT = "知识库未检测到相应资料，请联系管理员添加相应资料"
+CONTEXT_ROUTER_PROMPT = """You rewrite follow-up questions for a Chinese enterprise knowledge bot.
+只返回一个 JSON 对象，不要输出解释或其他内容：{"related": true或false, "domain": "product"或"training"或"unknown", "standalone_question": "改写后的完整问题"}。
+判断规则：
+1. 只有当前问题必须依赖最近对话才能理解时，related 才为 true。
+2. related 为 true 时，domain 必须与最近一轮对话的业务域相同。
+3. related 为 false 时，独立判断当前问题属于哪个业务域：
+   - product：财法通产品和服务相关问题。
+   - training：公司注册、代理记账、税务、许可证、公司注销等内部业务培训问题。
+4. standalone_question 必须是简洁、完整、可以单独用于检索的中文问题。
+5. related 为 true 时，根据最近对话补全省略的主体，消除“它、这个、那个”等模糊指代。
+6. related 为 false 时，standalone_question 必须保留员工原问题，不得擅自添加事实。
+7. 无法判断业务域时使用 unknown。
+8. 不要回答员工的业务问题，只负责判断和改写查询。"""
 
 
 @dataclass(frozen=True)
@@ -191,31 +203,27 @@ def format_recent_conversation(history: list[dict[str, str | float]]) -> str:
     return "\n".join(lines)
 
 
-def _parse_context_decision(raw: str) -> tuple[bool, str]:
-    # 上下文分流模型要求只返回 JSON，但实际模型偶尔会带解释文字。
-    # 这里先从回复中提取 {...}，再安全解析为“是否相关 + 业务域”。
-    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-    if match:
-        raw = match.group(0)
-    # 格式错误时保守地返回 unknown，让机器人继续追问，而不是猜错业务域。
+def _parse_context_decision(raw: str) -> tuple[bool, str, str]:
+    """Parse the exact JSON requested from the query-rewrite model."""
     try:
         value = json.loads(raw)
     except json.JSONDecodeError:
-        return False, "unknown"
+        return False, "unknown", ""
     if not isinstance(value, dict):
-        return False, "unknown"
+        return False, "unknown", ""
+
     domain = str(value.get("domain", "unknown")).lower()
-    related_value = value.get("related")
-    related = related_value is True or str(related_value).lower() == "true"
-    return related, domain if domain in {"product", "training", "unknown"} else "unknown"
+    if domain not in {"product", "training", "unknown"}:
+        domain = "unknown"
+    return value.get("related") is True, domain, str(value.get("standalone_question", "")).strip()
 
 
-def analyze_context_relation(question: str, history: list[dict[str, str | float]]) -> tuple[bool, str]:
-    """Use a short model call only for questions whose business domain is unclear."""
+def analyze_context_relation(question: str, history: list[dict[str, str | float]]) -> tuple[bool, str, str]:
+    """Classify an unclear question and rewrite contextual follow-ups for retrieval."""
     # 只有关键词无法判断的题目才走这次额外模型调用，正常问题不会多花一次时间和费用。
     primary = _route_from_env("PRIMARY_LLM", fallback_name="OPENAI")
     if not primary:
-        return False, "unknown"
+        return False, "unknown", question
     # 历史答案截断到 300 字，避免长回答导致上下文分流请求过大。
     compact_history = [
         {"domain": item["domain"], "question": item["question"], "answer": str(item["answer"])[:300]}
@@ -224,10 +232,15 @@ def analyze_context_relation(question: str, history: list[dict[str, str | float]
     payload = json.dumps({"recent_conversation": compact_history, "current_question": question}, ensure_ascii=False)
     # 分流模型失败时不让整个机器人崩溃，交由调用方提示员工选择资料范围。
     try:
-        return _parse_context_decision(_call_route(primary, payload, CONTEXT_ROUTER_PROMPT))
+        related, domain, standalone_question = _parse_context_decision(
+            _call_route(primary, payload, CONTEXT_ROUTER_PROMPT)
+        )
+        # 只有确实存在历史且模型判定为追问时才采用改写，防止独立问题被模型擅自改意。
+        related = related and bool(history)
+        return related, domain, (standalone_question or question) if related else question
     except Exception:
         logger.exception("Context routing analysis failed")
-        return False, "unknown"
+        return False, "unknown", question
 
 
 def require_environment() -> None:
@@ -239,6 +252,10 @@ def require_environment() -> None:
     ]
     if not _route_from_env("PRIMARY_LLM", fallback_name="OPENAI"):
         missing.append("PRIMARY_LLM_API_KEY 或 OPENAI_API_KEY")
+    if _load_balance_enabled():
+        if not _route_from_env("FALLBACK_LLM"):
+            missing.append("启用模型负载均衡时必须配置 FALLBACK_LLM_API_KEY 和 FALLBACK_LLM_MODEL")
+        _load_balance_weights()
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
@@ -264,6 +281,41 @@ def _route_from_env(prefix: str, *, fallback_name: str | None = None) -> LLMRout
         raise RuntimeError(f"{prefix}_PROTOCOL 必须是 responses 或 chat_completions")
     timeout = float(value("TIMEOUT_SECONDS", os.getenv("LLM_TIMEOUT_SECONDS", "45")))
     return LLMRoute(prefix.lower(), protocol, base_url, api_key, model, timeout)
+
+
+def _load_balance_enabled() -> bool:
+    return os.getenv("LLM_LOAD_BALANCE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_balance_weights() -> tuple[float, float]:
+    """Read and validate the relative request share for both model routes."""
+    try:
+        primary_weight = float(os.getenv("PRIMARY_LLM_WEIGHT", "70"))
+        fallback_weight = float(os.getenv("FALLBACK_LLM_WEIGHT", "30"))
+    except ValueError as exc:
+        raise RuntimeError("PRIMARY_LLM_WEIGHT 和 FALLBACK_LLM_WEIGHT 必须是数字") from exc
+    if primary_weight < 0 or fallback_weight < 0 or primary_weight + fallback_weight <= 0:
+        raise RuntimeError("模型线路权重不能为负数，并且至少一条线路的权重必须大于 0")
+    return primary_weight, fallback_weight
+
+
+def _ordered_llm_routes(primary: LLMRoute, fallback: LLMRoute | None) -> list[LLMRoute]:
+    """Choose the first route by weighted round robin and retain the other for failover."""
+    if not fallback:
+        return [primary]
+    if not _load_balance_enabled():
+        return [primary, fallback]
+
+    primary_weight, fallback_weight = _load_balance_weights()
+    total_weight = primary_weight + fallback_weight
+    global _llm_balance_accumulator
+    # 累加器会把备用线路均匀穿插在主线路之间。例如 70/30 在每 10 次中约分配 7 次和 3 次。
+    with _llm_balance_lock:
+        _llm_balance_accumulator += fallback_weight
+        if _llm_balance_accumulator >= total_weight:
+            _llm_balance_accumulator -= total_weight
+            return [fallback, primary]
+    return [primary, fallback]
 
 
 def _call_route(route: LLMRoute, payload: str, instructions: str = SYSTEM_PROMPT) -> str:
@@ -295,11 +347,10 @@ def _call_route(route: LLMRoute, payload: str, instructions: str = SYSTEM_PROMPT
 
 
 def _should_fallback(error: Exception) -> bool:
-    # 只有超时、网络中断、限流和服务器 5xx 才值得切换备用模型。
-    # 参数错误、提示词错误等配置问题切换也不会解决，因此直接报错更容易排查。
+    # 两条线路属于不同服务商：任意一条返回 HTTP 错误时，另一条仍可能正常。
     if isinstance(error, (APITimeoutError, APIConnectionError, RateLimitError)):
         return True
-    return isinstance(error, APIStatusError) and error.status_code >= 500
+    return isinstance(error, APIStatusError)
 
 
 def format_context(chunks: list[KnowledgeChunk]) -> str:
@@ -381,14 +432,13 @@ def answer_question_trace(
     department: str | None = None,
     domain: str | None = None,
     history: list[dict[str, str | float]] | None = None,
+    retrieval_question: str | None = None,
 ) -> dict[str, object]:
     # 完整问答核心：检索资料 → 构造模型输入 → 主备模型调用 → 返回答案、来源、耗时和错误。
     # 总计时从进入函数开始。后续性能日志会把检索和模型生成细分出来。
     started = time.perf_counter()
-    retrieval_question = question
-    # 追问时把上一轮问题与当前补充问题一起用于检索，例如“那它需要什么材料”。
-    if history:
-        retrieval_question = f"{history[-1]['question']}\n补充问题：{question}"
+    # 查询改写阶段已经把真正的追问补成独立问题；完整的新问题直接使用原文检索。
+    retrieval_question = retrieval_question or question
     chunks, performance = search_with_metrics(
         retrieval_question, limit=RETRIEVAL_LIMIT, department=department, domain=domain,
     )
@@ -406,8 +456,11 @@ def answer_question_trace(
     fallback = _route_from_env("FALLBACK_LLM")
     if not primary:
         raise RuntimeError("未配置主模型")
-    # 形成调用顺序：主模型始终优先；配置了备用模型时，符合条件的失败才切过去。
-    routes = [primary] + ([fallback] if fallback else [])
+    # 开启负载均衡时按权重选择首条线路；另一条线路仍保留为本次请求的故障备用。
+    routes = _ordered_llm_routes(primary, fallback)
+    initial_route = routes[0].name
+    audit_event("llm_route_selected", initial_route=initial_route, model=routes[0].model,
+                load_balancing=_load_balance_enabled())
     errors: list[str] = []
     # 依次尝试线路，并记录真正用到的模型和协议，方便之后在日志中比较稳定性与速度。
     for index, route in enumerate(routes):
@@ -418,20 +471,22 @@ def answer_question_trace(
             return {
                 "answer": finalize_answer(answer, chunks), "sources": chunks,
                 "elapsed_seconds": round(time.perf_counter() - started, 3), "error": None,
-                "route": route.name, "protocol": route.protocol, "model": route.model, "performance": performance,
+                "route": route.name, "initial_route": initial_route, "failover_used": index > 0,
+                "protocol": route.protocol, "model": route.model, "performance": performance,
             }
-        # 主线路发生可恢复故障时才继续下一条线路；其他异常立即结束，避免重复收费或隐藏配置错误。
+        # 首选线路发生可恢复故障时切换到另一条；其他异常立即结束，避免重复收费或隐藏配置错误。
         except Exception as exc:
             errors.append(f"{route.name}: {type(exc).__name__}: {exc}")
-            if index == 0 and fallback and _should_fallback(exc):
-                logger.warning("Primary model failed; switching to fallback", exc_info=True)
+            if index == 0 and len(routes) > 1 and _should_fallback(exc):
+                logger.warning("Selected model route failed; switching to alternate route", exc_info=True)
                 continue
             break
     # 主备线路都无法返回时，给员工稳定的友好提示，并把具体错误留在日志中供管理员排查。
     return {
         "answer": "AI 回复服务当前不可用，请稍后再试。", "sources": chunks,
         "elapsed_seconds": round(time.perf_counter() - started, 3), "error": " | ".join(errors),
-        "route": None, "protocol": None, "model": None, "performance": performance,
+        "route": None, "initial_route": initial_route, "failover_used": len(errors) > 1,
+        "protocol": None, "model": None, "performance": performance,
     }
 
 
@@ -484,23 +539,99 @@ class KnowledgeBotHandler(ChatbotHandler):
             domain, question, route_method = route_question(question)
             if domain:
                 _pending_domain_questions.pop(sender_id, None)
-        # 关键词分流仍不确定时，后台请求上下文分析模型。此处先向钉钉确认收到消息，避免超时重投。
-        if not domain or not question:
-            asyncio.create_task(self._analyze_context_and_reply(question, incoming))
-            return AckMessage.STATUS_OK, "OK"
-
-        # 业务域明确后，将完整回答工作放进后台。先返回 ACK，慢模型也不会导致钉钉重发同一消息。
-        asyncio.create_task(self._answer_and_reply(question, domain, route_method, incoming))
+        # 同一员工的下一题等待上一题完成，保证追问读取到已经写入的最新上下文。
+        previous_task = _sender_answer_tasks.get(sender_id)
+        task = asyncio.create_task(
+            self._run_queued_question(
+                sender_id, question, domain, route_method, incoming, previous_task,
+            )
+        )
+        _sender_answer_tasks[sender_id] = task
         return AckMessage.STATUS_OK, "OK"
 
-    async def _analyze_context_and_reply(self, question: str, incoming: ChatbotMessage):
+    async def _run_queued_question(
+        self,
+        sender_id: str,
+        question: str,
+        domain: str | None,
+        route_method: str,
+        incoming: ChatbotMessage,
+        previous_task: asyncio.Task[None] | None,
+    ) -> None:
+        """Process each sender's questions in arrival order while other senders remain concurrent."""
+        current_task = asyncio.current_task()
+        progress_done: asyncio.Event | None = None
+        progress_task: asyncio.Task[None] | None = None
+        try:
+            if previous_task:
+                if not previous_task.done():
+                    self.reply_text("上一条问题正在处理中，当前问题已进入等待。", incoming)
+                try:
+                    await previous_task
+                except Exception:
+                    logger.exception("Previous queued question failed; continuing with the next question")
+
+            progress_done = asyncio.Event()
+            progress_task = asyncio.create_task(self._send_progress_updates(incoming, progress_done))
+            if not domain or not question:
+                await self._analyze_context_and_reply(question, incoming, progress_done, progress_task)
+            else:
+                await self._answer_and_reply(
+                    question, domain, route_method, incoming,
+                    progress_done=progress_done, progress_task=progress_task,
+                )
+        except Exception:
+            logger.exception("Failed to process a queued DingTalk question")
+            if progress_done and progress_task:
+                await self._stop_progress_updates(progress_done, progress_task)
+            self.reply_text("暂时无法生成回答，请稍后重试。", incoming)
+        finally:
+            if _sender_answer_tasks.get(sender_id) is current_task:
+                _sender_answer_tasks.pop(sender_id, None)
+
+    async def _send_progress_updates(self, incoming: ChatbotMessage, progress_done: asyncio.Event) -> None:
+        """Send display-only status messages while the final answer is still being prepared."""
+        # 状态消息故意不调用 qa_logging；它们只是钉钉界面的等待提示，不是问答内容。
+        first_delay = random.uniform(1, 3)
+        await asyncio.sleep(first_delay)
+        if progress_done.is_set():
+            return
+        self.reply_text("正在生成回复（当前正在检索资料中）", incoming)
+
+        # 第二条从收到问题起在第 3～7 秒发出；第三条固定在第 7 秒左右发出。
+        second_target = random.uniform(3, 7)
+        await asyncio.sleep(max(0, second_target - first_delay))
+        if progress_done.is_set():
+            return
+        self.reply_text("已调取资料，请稍后", incoming)
+
+        await asyncio.sleep(max(0, 7 - second_target))
+        if not progress_done.is_set():
+            self.reply_text("正在生成回复，请稍后", incoming)
+
+    async def _stop_progress_updates(self, progress_done: asyncio.Event, progress_task: asyncio.Task[None]) -> None:
+        # 正式回复或业务域选择提示即将发出时，取消剩余的状态消息，避免它们在最终回复后出现。
+        progress_done.set()
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
+
+    async def _analyze_context_and_reply(
+        self,
+        question: str,
+        incoming: ChatbotMessage,
+        progress_done: asyncio.Event,
+        progress_task: asyncio.Task[None],
+    ):
         # 处理“那它呢”之类无法单靠关键词分流的问题：用近期对话判断是不是追问以及属于哪个业务域。
         sender_id = str(getattr(incoming, "sender_staff_id", None) or getattr(incoming, "sender_id", None) or "unknown")
         sender_name = str(getattr(incoming, "sender_nick", None) or "")
         # 上下文分析在线程中执行，因为模型 SDK 是同步调用，不能阻塞 asyncio 事件循环。
         history = recent_conversation(sender_id)
         analysis_started = time.perf_counter()
-        related, domain = await asyncio.to_thread(analyze_context_relation, question, history)
+        related, domain, retrieval_question = await asyncio.to_thread(analyze_context_relation, question, history)
         context_analysis_seconds = round(time.perf_counter() - analysis_started, 3)
         context_history = history if related else []
         # 如果模型确认是追问，以最近一轮历史的业务域为准，避免模型在 domain 字段中给出矛盾结果。
@@ -511,12 +642,14 @@ class KnowledgeBotHandler(ChatbotHandler):
             _pending_domain_questions[sender_id] = (question, time.time() + PENDING_DOMAIN_TTL_SECONDS)
             append_event("question_routing_uncertain", question=question, context_related=related,
                          sender_id=sender_id, sender_name=sender_name)
+            await self._stop_progress_updates(progress_done, progress_task)
             self.reply_text(DOMAIN_PROMPT, incoming)
             return
         # 已得到可用业务域后，继续走和普通问题相同的回答与日志流程。
         route_method = "context_analysis_related" if related else "context_analysis_new"
         await self._answer_and_reply(
             question, domain, route_method, incoming, context_history, context_analysis_seconds,
+            progress_done, progress_task, retrieval_question,
         )
 
     async def _answer_and_reply(
@@ -527,19 +660,24 @@ class KnowledgeBotHandler(ChatbotHandler):
         incoming: ChatbotMessage,
         history: list[dict[str, str | float]] | None = None,
         context_analysis_seconds: float = 0.0,
+        progress_done: asyncio.Event | None = None,
+        progress_task: asyncio.Task[None] | None = None,
+        retrieval_question: str | None = None,
     ):
         # 最终后台任务：写“收到问题”日志 → 检索和生成答案 → 写性能和答案日志 → 回复钉钉。
         sender_id = str(getattr(incoming, "sender_staff_id", None) or getattr(incoming, "sender_id", None) or "unknown")
         sender_name = str(getattr(incoming, "sender_nick", None) or "")
         try:
-            # 没有从上下文分析传入历史时，按当前业务域单独取员工最近对话。
+            # 只有上下文分析确认是追问时才传入历史；完整的新问题不携带旧回答。
             if history is None:
-                history = recent_conversation(sender_id, domain)
+                history = []
             # question_id 把后续的答案、性能和反馈关联到同一个员工问题。
             question_id = append_event("question_received", question=question, domain=domain, route_method=route_method, context_turns=len(history), question_length=len(question), sender_id=sender_id, sender_name=sender_name)
             _latest_question_by_sender[sender_id] = question_id
             # 检索、Embedding 和模型调用均是同步且可能很慢的操作，放进线程后不会卡住其他钉钉消息。
-            result = await asyncio.to_thread(answer_question_trace, question, None, domain, history)
+            result = await asyncio.to_thread(
+                answer_question_trace, question, None, domain, history, retrieval_question,
+            )
             reply = str(result["answer"])
             # 只有成功回答才记入对话历史，失败提示不能成为后续追问的上下文依据。
             if result["error"] is None:
@@ -550,12 +688,16 @@ class KnowledgeBotHandler(ChatbotHandler):
             performance["total_seconds"] = round(float(result["elapsed_seconds"]) + context_analysis_seconds, 3)
             append_performance(
                 question=question, domain=domain, route_method=route_method,
-                llm_route=result["route"], llm_model=result["model"], **performance,
+                initial_llm_route=result.get("initial_route"), llm_route=result["route"],
+                failover_used=result.get("failover_used", False), llm_model=result["model"], **performance,
             )
             append_event("question_answered", question_id=question_id, question=question, answer=reply,
+                         retrieval_question=retrieval_question or question,
                          sources=source_summary(result["sources"]), elapsed_seconds=result["elapsed_seconds"],
                          error=result["error"], llm_route=result["route"], llm_protocol=result["protocol"],
                          llm_model=result["model"], fallback_used=result["route"] == "fallback_llm",
+                         initial_llm_route=result.get("initial_route"),
+                         failover_used=result.get("failover_used", False),
                          domain=domain, route_method=route_method,
                          sender_id=sender_id, sender_name=sender_name)
         # 任意未处理异常都转换成友好回复，并额外记 error 事件，防止后台任务静默失败。
@@ -564,6 +706,8 @@ class KnowledgeBotHandler(ChatbotHandler):
             reply = "暂时无法生成回答，请稍后重试。"
             append_event("question_error", question=question, error="handler_exception", sender_id=sender_id, sender_name=sender_name)
 
+        if progress_done and progress_task:
+            await self._stop_progress_updates(progress_done, progress_task)
         self.reply_text(reply, incoming)
 
 
