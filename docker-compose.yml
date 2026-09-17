@@ -8,13 +8,18 @@ services:
       OBSIDIAN_VAULT_PATH: /data/knowledge
       RAG_INDEX_PATH: /app/data/rag/rag_index.json
       QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
+      RAG_STORAGE: ${RAG_STORAGE:-postgres}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://knowledge:change_me_local_only@postgres:5432/knowledge}
     restart: unless-stopped
     volumes:
       - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
       - rag_data:/app/data/rag
       - app_data:/app/data/logs
     depends_on:
-      - redis
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
   api:
     build: .
     image: dingtalk-gpt-knowledge-bot:local
@@ -24,6 +29,8 @@ services:
       OBSIDIAN_VAULT_PATH: /data/knowledge
       RAG_INDEX_PATH: /app/data/rag/rag_index.json
       QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
+      RAG_STORAGE: ${RAG_STORAGE:-postgres}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://knowledge:change_me_local_only@postgres:5432/knowledge}
     restart: unless-stopped
     volumes:
       - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
@@ -31,6 +38,11 @@ services:
       - app_data:/app/data/logs
     ports:
       - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8000}:8000"
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
   indexer:
     build: .
     image: dingtalk-gpt-knowledge-bot:local
@@ -39,6 +51,8 @@ services:
     environment:
       OBSIDIAN_VAULT_PATH: /data/knowledge
       RAG_INDEX_PATH: /app/data/rag/rag_index.json
+      RAG_STORAGE: ${RAG_STORAGE:-postgres}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://knowledge:change_me_local_only@postgres:5432/knowledge}
     volumes:
       - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
       - rag_data:/app/data/rag
@@ -50,7 +64,26 @@ services:
     volumes:
       - redis_data:/data
 
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-knowledge}
+      POSTGRES_USER: ${POSTGRES_USER:-knowledge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local_only}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-15432}:5432"
+
 volumes:
   redis_data:
   rag_data:
   app_data:
+  postgres_data:

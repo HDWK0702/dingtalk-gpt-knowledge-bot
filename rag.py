@@ -75,12 +75,17 @@ def build_index(chunks: list["KnowledgeChunk"], batch_size: int = 16) -> int:
 
     # 保存本次使用的模型和内容指纹。回答时会检查模型是否一致，避免拿不同坐标系的向量硬比较。
     _, model = _embedding_client()
+    source_fingerprint = hashlib.sha256(
+        "\n".join(f"{record['source_path']}:{record['content']}" for record in records).encode("utf-8")
+    ).hexdigest()
+    if _postgres_enabled():
+        from postgres_store import replace_index
+        return replace_index(chunks, [record["vector"] for record in records], model, source_fingerprint)
+
     payload = {
         "format_version": INDEX_FORMAT_VERSION,
         "embedding_model": model,
-        "source_fingerprint": hashlib.sha256(
-            "\n".join(f"{record['source_path']}:{record['content']}" for record in records).encode("utf-8")
-        ).hexdigest(),
+        "source_fingerprint": source_fingerprint,
         "items": records,
     }
     # 确保输出目录存在，再把完整索引一次写入。下次重建会覆盖旧索引。
@@ -88,6 +93,11 @@ def build_index(chunks: list["KnowledgeChunk"], batch_size: int = 16) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return len(records)
+
+
+def _postgres_enabled() -> bool:
+    from postgres_store import is_enabled
+    return is_enabled()
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -118,24 +128,41 @@ def search_with_metrics(
         include_inactive = domain
         domain = None
 
-    # 索引不存在时不能临时从全文建立，因为那会很慢且会额外消耗 Embedding 费用，所以明确提示先建索引。
-    source = index_path()
-    if not source.is_file():
-        raise RuntimeError("向量索引尚未建立，请先运行 python index_knowledge.py。")
-
-    # 读取 JSON 索引并核对 Embedding 模型。更换模型后必须重建，否则向量维度或含义可能不一致。
-    started = time.perf_counter()
-    payload = json.loads(source.read_text(encoding="utf-8"))
-    index_load_seconds = time.perf_counter() - started
+    # JSON 模式读取本地索引；PostgreSQL 模式直接查询数据库，不再读取 rag_index.json。
+    index_load_seconds = 0.0
+    payload: dict[str, object] = {}
     _, configured_model = _embedding_client()
-    if payload.get("embedding_model") != configured_model:
-        raise RuntimeError("Embedding 模型已变更，请重新运行 python index_knowledge.py 建立索引。")
+    if not _postgres_enabled():
+        source = index_path()
+        if not source.is_file():
+            raise RuntimeError("向量索引尚未建立，请先运行 python index_knowledge.py。")
+        started = time.perf_counter()
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        index_load_seconds = time.perf_counter() - started
+        if payload.get("embedding_model") != configured_model:
+            raise RuntimeError("Embedding 模型已变更，请重新运行 python index_knowledge.py 建立索引。")
 
     # 只把员工问题转成一个向量；知识库文档向量已在建立索引时提前保存。
     embedding_started = time.perf_counter()
     question_vector = _embed([question])[0]
     embedding_seconds = time.perf_counter() - embedding_started
     vector_search_started = time.perf_counter()
+    if _postgres_enabled():
+        from postgres_store import search as postgres_search
+        rows = postgres_search(question_vector, limit, department, domain, include_inactive, configured_model)
+        chunks = [KnowledgeChunk(
+            title=str(row["title"]),
+            url=str(row["source_url"]),
+            content=str(row["content"]),
+            source_path=str(row.get("source_path", "")),
+            metadata={str(key): str(value) for key, value in (row.get("metadata") or {}).items()},
+        ) for row in rows]
+        return chunks, {
+            "index_load_seconds": 0.0,
+            "embedding_seconds": round(embedding_seconds, 3),
+            "vector_search_seconds": round(time.perf_counter() - vector_search_started, 3),
+        }
+
     # 逐条扫描索引前先做状态、部门和业务域过滤。
     # 这样无权资料不会进入相似度比较，更不会被送给大模型。
     scored: list[tuple[float, KnowledgeChunk]] = []

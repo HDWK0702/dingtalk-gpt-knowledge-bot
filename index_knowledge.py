@@ -2,6 +2,7 @@
 
 from knowledge import load_chunks
 from rag import build_index, index_path
+from postgres_store import is_enabled
 
 
 def main() -> None:
@@ -10,7 +11,10 @@ def main() -> None:
     chunks = load_chunks()
     count = build_index(chunks)
     print(f"向量索引建立成功：{count} 个文本段落")
-    print(f"索引文件：{index_path().resolve()}")
+    if is_enabled():
+        print("索引位置：PostgreSQL + pgvector（Docker 卷 postgres_data）")
+    else:
+        print(f"索引文件：{index_path().resolve()}")
 
 
 if __name__ == "__main__":

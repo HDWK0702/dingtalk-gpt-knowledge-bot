@@ -42,7 +42,7 @@ KNOWLEDGE_PATH=E:/company-knowledge
 docker compose run --rm indexer
 ```
 
-看到“向量索引建立成功”后，启动机器人、健康检查 API 和 Redis：
+看到“向量索引建立成功”后，启动机器人、健康检查 API、Redis 和 PostgreSQL + pgvector：
 
 ```powershell
 docker compose up -d --build
@@ -54,6 +54,23 @@ docker compose up -d --build
 Invoke-WebRequest http://127.0.0.1:8000/health
 docker compose ps
 ```
+
+Docker 配置中的 `RAG_STORAGE=postgres` 表示向量索引会写入 PostgreSQL 的
+`rag_chunks` 表，`pgvector` 负责按余弦距离搜索向量。数据库数据保存在
+`postgres_data` 卷中，只映射到宿主机 `127.0.0.1:15432`，不会暴露到公网。若暂时想继续使用本地 JSON，
+把 `RAG_STORAGE` 改成 `json` 即可。
+
+如果已有 `rag_index.json`，可先启动 PostgreSQL，再运行一次迁移工具：
+
+```powershell
+docker compose up -d postgres
+$env:DATABASE_URL="postgresql://knowledge:change_me_local_only@127.0.0.1:15432/knowledge"
+$env:PGVECTOR_DIMENSIONS="1024"
+uv run --python .venv python migrate_json_to_postgres.py
+```
+
+这一步只搬运已有向量，不会重复调用 Embedding。迁移完成后，Docker 中的机器人和
+API 会从 PostgreSQL + pgvector 查询。
 
 查看机器人日志：
 
@@ -72,7 +89,7 @@ docker compose down
 ### 更新知识库资料
 
 1. 在 `KNOWLEDGE_PATH` 指向的文件夹中增加或修改 `.md` 文件。
-2. 重新建立索引：`docker compose run --rm indexer`。
+2. 重新建立索引：`docker compose run --rm indexer`（Embedding 会写入 PostgreSQL + pgvector）。
 3. 重启机器人以载入新索引：`docker compose restart bot api`。
 
 ## 项目结构
@@ -83,7 +100,7 @@ api.py                  /health 和内部检索 API
 knowledge.py            读取、筛选和切分 Markdown 知识
 rag.py                  Embedding、索引和向量相似度检索
 index_knowledge.py      一次性建立或更新向量索引
-docker-compose.yml      启动机器人、API、Redis 和索引工具
+docker-compose.yml      启动机器人、API、Redis、PostgreSQL + pgvector 和索引工具
 .env.docker.example     Docker 使用者复制的配置模板
 demo/knowledge/         可安全使用的示例知识，不含企业资料
 ```
