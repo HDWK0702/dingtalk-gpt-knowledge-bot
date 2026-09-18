@@ -171,18 +171,19 @@ uv run --python .venv python chunk_knowledge.py
 - 长文按 Markdown 标题分章节，再优先按完整段落、换行和句子切分；
   没有合适边界的超长内容才按字符拆开。
 - 每段保留文档标题，长文同时保留章节层级；来源链接和原文件路径单独保存。
-- `.env` 可设置 `CHUNK_SIZE_CHARS=1000`、`CHUNK_OVERLAP_CHARS=120`。
-  字符上限包括标题上下文，单位是字符而不是 Token。两段在同一章节内
-  最多重叠 120 字符；短文不需要重叠，完整段落优先，代码块不添加重复尾段。
+- `.env` 使用 `CHUNK_MODE=structure|recursive|semantic`、`CHUNK_SIZE_TOKENS=512` 和 `CHUNK_OVERLAP_RATIO=0.15`；重叠比例必须在 10%～25% 之间。固定字符模式不再作为生产配置。
+  目标值按估算 token 计算，并包含标题上下文；短文不需要重叠，完整段落优先，代码块不添加重复尾段。
 - 表格和代码块在长度允许时整体保留；超长块仍需拆开，复杂表格建议后续单独解析。
 - `status`、`exclude_from_rag` 和现有部门过滤规则继续生效；
   新增 `chunk_id`、`chunk_number`、`chunk_count`、`section` 元数据。
 
-可先试其他参数查看效果：
+可先试其他正式模式和参数查看效果：
 
 ```powershell
-uv run --python .venv python chunk_knowledge.py --size 800 --overlap 100
+uv run --python .venv python chunk_knowledge.py --mode semantic --tokens 512 --overlap-ratio 0.15
 ```
+
+`--size` 和 `--overlap` 仍保留用于旧版字符预览和兼容测试，不会改变正式 `.env` 配置。
 
 这两个命令行参数只影响预览。要应用到向量索引，把同样的值写入 `.env`，
 然后运行下面的建索引命令。运行中的机器人需要重新启动才会载入代码修改。

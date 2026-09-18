@@ -5,6 +5,7 @@ __pycache__/
 *.log
 rag_index.json
 data/chunks-preview/
+data/chunks-preview-*/
 data/load-tests/
 data/qa_logs.jsonl
 data/qa_logs.md

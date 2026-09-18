@@ -6,6 +6,8 @@
 
 - 已跑通钉钉 Stream → Python → 知识检索 → 大模型 → 钉钉回复链路。
 - Obsidian 中的新人培训手册已按章节、小节拆分；Markdown 可按标题、段落和句子生成 Chunk。
+- Chunk 已支持三种正式模式：`structure`（标题、表格、代码块优先）、`recursive`（段落到句子逐级拆分）和 `semantic`（离线句子主题连续性分组）；固定字符模式不再作为生产配置。
+- 生产默认目标为 `512` 个估算 token，`CHUNK_OVERLAP_RATIO` 限制在 `10%～25%`，当前默认 `15%`；每个子 Chunk 带父块 ID、来源路径、章节层级、页码、时间戳和入库时间。
 - 已接入 `BAAI/bge-m3`，向量维度为 1024；PostgreSQL + pgvector 当前有 374 个 Chunk，并建立 HNSW 索引。
 - 已实现产品知识与新人培训知识的业务域过滤，检索 4 条资料，员工最多看到 2 条去重来源。
 - 已实现无资料拒答、相关资料摘要、三轮短期上下文、问答日志、性能日志和“有用/没用”反馈指令。
@@ -13,7 +15,7 @@
 - 已增加回答等待提示：1～3 秒提示检索中，3～7 秒提示已调取资料，7 秒后提示正在生成；提示不写问答日志。
 - 已实现两条模型线路加权轮询和互为故障备用。当前 `.env` 为 50/50；Fallback 调用正常，Primary 的火山方舟地址与硅基流动模型名混用会返回 404。
 - 已为负载均衡记录初始线路、最终线路和是否故障切换；本地测试最近一次为 `26 passed, 80 subtests passed`。
-- Git 当前基线提交为 `8fb33a5`，标签为 `local-rag-pgvector-v2`，远端 `origin/main` 指向该提交。
+- 当前分支基线提交为 `8ed75f8`（`update-V2`），远端 `origin/main` 与本地 `main` 指向同一提交；工作区仍有未提交修改。
 
 # 3. 关键决定及原因
 
@@ -25,6 +27,7 @@
 - 模型负载均衡采用“每题正常只调用一条线路，失败时切另一条”，用于提升多人并发能力并控制调用成本；当前设为 50/50。
 - 学习记录、开发待办和原始备份使用 `exclude_from_rag: true`，防止开发内容进入业务答案。
 - 当前修改优先保留在本地；除非用户明确要求，不自动重建或重启 Docker。
+- 三种模式已在当前 Obsidian 知识库完成离线预览：357 篇文档、每种 415 个 Chunk，最大约 517 个估算 token；预览不调用 Embedding，不改变现有向量索引。
 
 # 4. 涉及的文件
 
@@ -53,6 +56,7 @@
 - 将固定时间等待提示改为事件驱动提示，例如检索真正完成后再说“已调取资料”。
 - 增加 Redis 限流、精确缓存、请求合并；随后完善身份、部门权限、文档审核发布、版本、生效日期和审计。
 - 完成 OSS、云端 RDS/Redis、Nginx/HTTPS、监控告警、自动备份和恢复演练后再正式上线。
+- 下一阶段按既定链路实现：查询改写 → BM25/向量混合检索 → 子块命中后的父块召回 → Rerank → 上下文压缩；本轮只完成 Chunk 和入库元数据，尚未重建 Embedding 索引。
 
 # 6. 已知问题和验证方法
 
@@ -65,6 +69,6 @@
 - Primary 目前配置为火山方舟 Base URL，但模型名使用了硅基流动的 `deepseek-ai/DeepSeek-V4-Flash`，会返回 404；代码已允许该错误自动切到 Fallback，但仍应将 Primary 模型改为有效的火山方舟 Endpoint ID。
 - `.env` 与 `.env.docker.example` 当前为 50/50 且启用，`.env.example` 仍为关闭并保留 70/30 示例，配置说明尚未统一。
 - 工作区有未提交修改。验证：`git status --short`；不要覆盖或丢弃这些改动。
-- 基础回归：`uv run --python .venv python -m pytest -q`，预期最近基线为 26 项通过、80 个 subtests 通过。
+- 基础回归：`uv run --python .venv python -m pytest -q`，当前为 45 项通过、137 个 subtests 通过。
 - 运行检查：`docker compose ps`；模型线路检查：`docker compose logs --tail 200 bot`，应看到 `llm_route_selected` 及对应接口 200。
 - 数据库检查：`docker compose exec postgres psql -U knowledge -d knowledge -c "SELECT COUNT(*) FROM rag_chunks;"`，当前预期为 374。

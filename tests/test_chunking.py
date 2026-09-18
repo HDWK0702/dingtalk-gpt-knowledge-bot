@@ -11,12 +11,44 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from chunking import split_markdown
+from chunking import estimate_tokens, split_markdown
 
 
 class MarkdownChunkTests(unittest.TestCase):
+    def test_production_modes_use_token_budget_and_keep_mode(self):
+        body = "。".join(f"这是第{i}段关于公司注册材料和办理流程的说明" for i in range(80))
+        for mode in ("recursive", "semantic", "structure"):
+            with self.subTest(mode=mode):
+                chunks = split_markdown("新人培训手册", body, mode=mode, max_tokens=128, overlap_ratio=0.15)
+                self.assertGreater(len(chunks), 1)
+                self.assertTrue(all(chunk.chunk_mode == mode for chunk in chunks))
+                self.assertTrue(all(estimate_tokens(chunk.content) <= 150 for chunk in chunks))
+
+    def test_production_overlap_ratio_is_limited(self):
+        body = "这是用于验证重叠比例的长段落。" * 200
+        for ratio in (0.09, 0.26):
+            with self.subTest(ratio=ratio):
+                with self.assertRaises(ValueError):
+                    split_markdown("测试", body, mode="recursive", max_tokens=128, overlap_ratio=ratio)
+
+    def test_fixed_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            split_markdown("测试", "正文", mode="fixed", max_tokens=512, overlap_ratio=0.15)
+
+    def test_token_modes_keep_overlap_when_blocks_roll_into_new_chunks(self):
+        body = "\n\n".join(
+            f"第{i}段关于公司注册材料和办理流程的详细说明。" * 12
+            for i in range(8)
+        )
+        chunks = split_markdown("手册", body, mode="recursive", max_tokens=128, overlap_ratio=0.15)
+        self.assertGreater(len(chunks), 1)
+        for previous, current in zip(chunks, chunks[1:]):
+            tail = previous.content[-32:].strip()
+            self.assertTrue(any(tail[index:index + 8] in current.content for index in range(max(0, len(tail) - 16))))
+            self.assertLessEqual(estimate_tokens(current.content), 128)
+
     def test_short_faq_question_and_answer_stay_together(self):
         body = "## 问题\n出差住宿能报多少？\n\n## 答案\n每晚不超过三百元，需提供发票。"
         chunks = split_markdown("差旅常见问题", body)
@@ -114,6 +146,59 @@ class MarkdownChunkTests(unittest.TestCase):
             [(chunk.content, chunk.section) for chunk in second],
         )
 
+    def test_small_table_is_never_split(self):
+        body = (
+            "## 纳税人对比\n\n"
+            "| 对比项 | 小规模纳税人 | 一般纳税人 |\n"
+            "| --- | --- | --- |\n"
+            "| 划分标准 | 500 万元及以下 | 超过 500 万元 |\n"
+        )
+        chunks = split_markdown("税务基础", body)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("| 划分标准 |", chunks[0].content)
+        self.assertIn("| 对比项 | 小规模纳税人 | 一般纳税人 |", chunks[0].content)
+
+    def test_oversized_table_is_split_by_rows_and_keeps_its_header(self):
+        # 每行约 60 字符，40 行必然超过 256 的预算，用来验证拆分后表头是否被重复带上。
+        rows = [f"| 规则{i:02d} | 说明{i:02d} 适用于差旅报销的核算口径 |" for i in range(40)]
+        body = (
+            "## 报销标准\n\n"
+            "| 项目 | 说明 |\n"
+            "| --- | --- |\n"
+            + "\n".join(rows)
+        )
+        chunks = split_markdown("财务制度", body, 256, 30)
+        self.assertGreater(len(chunks), 1)
+        header_cells = {"项目", "说明"}
+        for chunk in chunks:
+            with self.subTest(section=chunk.section):
+                # 每一片都必须能看出这两列讲的是什么，否则表格等于被切坏。
+                for cell in header_cells:
+                    self.assertIn(cell, chunk.content)
+        # 每一行数据都必须完整落在某一个 Chunk 里，不能在某一行中间断开。
+        for row in rows:
+            with self.subTest(row=row):
+                self.assertTrue(any(row in chunk.content for chunk in chunks))
+
+    def test_short_document_still_carries_its_heading_path(self):
+        # 这是修复前的 bug：短文直接返回 section=""，导致 8.7 那批短问答无法按章节过滤。
+        body = "# 第八章\n\n## 8.7 税务基础\n\n小规模纳税人季度 30 万以下免征增值税。"
+        chunks = split_markdown("百问百答", body)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("8.7 税务基础", chunks[0].section)
+        self.assertEqual(chunks[0].chapter, "第八章")
+        self.assertEqual(chunks[0].section_title, "8.7 税务基础")
+
+    def test_heading_levels_are_exposed_as_separate_fields(self):
+        body = "# 第二章 公司注册\n\n## 2.7 会计代理\n\n### 2.7.4 代理记账产品\n\n" + "正文内容。" * 200
+        chunks = split_markdown("新人培训手册", body, 256, 30)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            with self.subTest(section=chunk.section):
+                self.assertEqual(chunk.chapter, "第二章 公司注册")
+                self.assertEqual(chunk.section_title, "2.7 会计代理")
+                self.assertEqual(chunk.subsection, "2.7.4 代理记账产品")
+
 
 class VaultLoadingTests(unittest.TestCase):
     @classmethod
@@ -160,12 +245,54 @@ class VaultLoadingTests(unittest.TestCase):
         all_chunks = self.knowledge.load_chunks(include_inactive=True)
         self.assertEqual({chunk.title for chunk in all_chunks}, {"有效制度", "草稿"})
 
+    def test_chunk_metadata_has_parent_and_source_location_fields(self):
+        source = self.write_note(
+            "有来源的手册",
+            "---\nstatus: active\npage_start: 12\npage_end: 14\n"
+            "timestamp_start: 00:01:02\ntimestamp_end: 00:02:03\n---\n"
+            + ("公司注册材料需要核验主体资格和注册地址。" * 180),
+        )
+        chunks = self.knowledge.load_chunks(chunk_mode="recursive", size_tokens=128, overlap_ratio=0.15)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            metadata = chunk.metadata or {}
+            self.assertEqual(metadata["source_path"], str(source))
+            self.assertEqual(metadata["page_start"], "12")
+            self.assertEqual(metadata["page_end"], "14")
+            self.assertEqual(metadata["timestamp_start"], "00:01:02")
+            self.assertEqual(metadata["timestamp_end"], "00:02:03")
+            self.assertTrue(metadata["ingested_at"])
+            self.assertTrue(metadata["parent_id"])
+            self.assertTrue(metadata["parent_content"])
+
     def test_department_filter_is_preserved(self):
         self.write_note("全员指南", "---\ndepartment: all\n---\n公司公开资料。")
         self.write_note("财务制度", "---\ndepartment: 财务\n---\n部门报销操作资料。")
         self.write_note("人事制度", "---\ndepartment: 人事\n---\n部门招聘操作资料。")
         chunks = self.knowledge.load_chunks(department="财务")
         self.assertEqual({chunk.title for chunk in chunks}, {"全员指南", "财务制度"})
+
+    def test_rerank_api_reorders_candidates_and_keeps_requested_limit(self):
+        chunks = [
+            self.knowledge.KnowledgeChunk("资料一", "url:1", "普通内容"),
+            self.knowledge.KnowledgeChunk("资料二", "url:2", "最相关内容"),
+            self.knowledge.KnowledgeChunk("资料三", "url:3", "次相关内容"),
+        ]
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = (
+            b'{"results":[{"index":1,"relevance_score":0.95},{"index":2,"relevance_score":0.80}]}'
+        )
+        settings = {
+            "RERANK_ENABLED": "true",
+            "RERANK_URL": "https://rerank.example/v1/rerank",
+            "RERANK_API_KEY": "test-key",
+            "RERANK_MODEL": "test-model",
+        }
+        with patch.dict(os.environ, settings, clear=False), patch.object(self.knowledge, "urlopen", return_value=response):
+            ranked, elapsed = self.knowledge._rerank_chunks("哪个最相关？", chunks, 2)
+
+        self.assertEqual([chunk.title for chunk in ranked], ["资料二", "资料三"])
+        self.assertGreaterEqual(elapsed, 0)
 
 
 if __name__ == "__main__":

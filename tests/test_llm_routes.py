@@ -37,6 +37,11 @@ class LLMRouteTests(unittest.TestCase):
             answer = self.main._call_route(route, "员工问题：测试")
         self.assertEqual(answer, "主线路答案")
 
+    def test_friendly_error_identifies_failed_stage_in_chinese(self):
+        message = self.main._friendly_error("上下文判断和查询改写", ValueError("bad format"))
+        self.assertIn("【上下文判断和查询改写失败】", message)
+        self.assertIn("返回内容或配置格式不正确", message)
+
     def test_context_decision_includes_standalone_question(self):
         raw = '{"related": true, "domain": "training", "standalone_question": "第三类医疗器械需要什么材料？"}'
         self.assertEqual(
@@ -56,6 +61,26 @@ class LLMRouteTests(unittest.TestCase):
             related, domain, rewritten = self.main.analyze_context_relation("公司注销是什么？", [])
 
         self.assertEqual((related, domain, rewritten), (False, "training", "公司注销是什么？"))
+
+    def test_context_analysis_fails_over_when_primary_model_is_unavailable(self):
+        primary = self.main.LLMRoute("primary_llm", "chat_completions", "", "key", "primary", 12)
+        fallback = self.main.LLMRoute("fallback_llm", "chat_completions", "", "key", "fallback", 12)
+        history = [{"created_at": 1.0, "domain": "training", "question": "第二类医疗器械的要求", "answer": "经营条件"}]
+        unavailable = self.main.APIStatusError(
+            "Model not open",
+            response=httpx.Response(404, request=httpx.Request("POST", "https://primary.example/v1/chat/completions")),
+            body={"error": "model not open"},
+        )
+
+        def route_from_env(prefix, **_):
+            return primary if prefix == "PRIMARY_LLM" else fallback
+
+        with patch.object(self.main, "_route_from_env", side_effect=route_from_env), \
+             patch.object(self.main, "_ordered_llm_routes", return_value=[primary, fallback]), \
+             patch.object(self.main, "_call_route", side_effect=[unavailable, '{"related": true, "domain": "training", "standalone_question": "第二类医疗器械的人员材料有哪些？"}']):
+            related, domain, rewritten = self.main.analyze_context_relation("那他的人员材料呢", history)
+
+        self.assertEqual((related, domain, rewritten), (True, "training", "第二类医疗器械的人员材料有哪些？"))
 
     def test_same_sender_question_waits_for_previous_answer(self):
         async def exercise():

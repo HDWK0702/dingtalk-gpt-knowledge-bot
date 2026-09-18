@@ -54,6 +54,12 @@ def ensure_schema(conn: Any, dimensions: int) -> None:
                 source_url TEXT NOT NULL,
                 content TEXT NOT NULL,
                 source_path TEXT NOT NULL,
+                page_start TEXT NOT NULL DEFAULT '',
+                page_end TEXT NOT NULL DEFAULT '',
+                timestamp_start TEXT NOT NULL DEFAULT '',
+                timestamp_end TEXT NOT NULL DEFAULT '',
+                parent_id TEXT NOT NULL DEFAULT '',
+                chunk_mode TEXT NOT NULL DEFAULT 'structure',
                 metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 embedding VECTOR({dimensions}) NOT NULL,
                 embedding_model TEXT NOT NULL,
@@ -61,6 +67,16 @@ def ensure_schema(conn: Any, dimensions: int) -> None:
             )
             """
         )
+        # 老数据库已经存在时，用可重复执行的迁移补上新入库标准，不删除已有 Chunk。
+        for column, definition in {
+            "page_start": "TEXT NOT NULL DEFAULT ''",
+            "page_end": "TEXT NOT NULL DEFAULT ''",
+            "timestamp_start": "TEXT NOT NULL DEFAULT ''",
+            "timestamp_end": "TEXT NOT NULL DEFAULT ''",
+            "parent_id": "TEXT NOT NULL DEFAULT ''",
+            "chunk_mode": "TEXT NOT NULL DEFAULT 'structure'",
+        }.items():
+            cursor.execute(f"ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS {column} {definition}")
         cursor.execute("CREATE INDEX IF NOT EXISTS rag_chunks_domain_idx ON rag_chunks ((metadata->>'domain'))")
         cursor.execute("CREATE INDEX IF NOT EXISTS rag_chunks_embedding_hnsw_idx ON rag_chunks USING hnsw (embedding vector_cosine_ops)")
         cursor.execute(
@@ -92,13 +108,18 @@ def replace_index(chunks: Iterable[Any], vectors: list[list[float]], model: str,
                 rows.append((
                     str(metadata.get("chunk_id") or chunk.source_path + ":" + chunk.title),
                     chunk.title, chunk.url, chunk.content, chunk.source_path,
+                    str(metadata.get("page_start", "")), str(metadata.get("page_end", "")),
+                    str(metadata.get("timestamp_start", "")), str(metadata.get("timestamp_end", "")),
+                    str(metadata.get("parent_id", "")), str(metadata.get("chunk_mode", "structure")),
                     json.dumps(metadata, ensure_ascii=False), _vector_literal(vector), model,
                 ))
             cursor.executemany(
                 """
                 INSERT INTO rag_chunks
-                    (chunk_id, title, source_url, content, source_path, metadata, embedding, embedding_model)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::vector, %s)
+                    (chunk_id, title, source_url, content, source_path,
+                     page_start, page_end, timestamp_start, timestamp_end,
+                     parent_id, chunk_mode, metadata, embedding, embedding_model)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector, %s)
                 """, rows,
             )
             cursor.execute(

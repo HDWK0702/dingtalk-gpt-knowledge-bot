@@ -8,6 +8,8 @@ services:
       OBSIDIAN_VAULT_PATH: /data/knowledge
       RAG_INDEX_PATH: /app/data/rag/rag_index.json
       QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
+      RETRIEVAL_LOG_PATH: /app/data/logs/retrieval_logs.jsonl
+      RETRIEVAL_LOG_MD_PATH: /app/data/logs/retrieval_logs.md
       RAG_STORAGE: ${RAG_STORAGE:-postgres}
       # Containers reach PostgreSQL through its Docker service name, not Windows localhost.
       DATABASE_URL: postgresql://${POSTGRES_USER:-knowledge}:${POSTGRES_PASSWORD:-change_me_local_only}@postgres:5432/${POSTGRES_DB:-knowledge}
@@ -30,6 +32,8 @@ services:
       OBSIDIAN_VAULT_PATH: /data/knowledge
       RAG_INDEX_PATH: /app/data/rag/rag_index.json
       QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
+      RETRIEVAL_LOG_PATH: /app/data/logs/retrieval_logs.jsonl
+      RETRIEVAL_LOG_MD_PATH: /app/data/logs/retrieval_logs.md
       RAG_STORAGE: ${RAG_STORAGE:-postgres}
       DATABASE_URL: postgresql://${POSTGRES_USER:-knowledge}:${POSTGRES_PASSWORD:-change_me_local_only}@postgres:5432/${POSTGRES_DB:-knowledge}
     restart: unless-stopped

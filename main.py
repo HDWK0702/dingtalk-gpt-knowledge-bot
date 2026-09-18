@@ -23,7 +23,7 @@ except ImportError:  # Optional for local development.
 
 # 业务模块：knowledge 负责检索，qa_logging 负责把问答和性能写入本地日志。
 from knowledge import KnowledgeChunk, search_with_metrics
-from qa_logging import append_event, append_performance, source_summary
+from qa_logging import append_event, append_performance, append_retrieval, source_summary
 
 # 读取 .env 后建立统一日志格式。密钥只从环境变量读取，不写进代码或日志。
 load_dotenv()
@@ -84,7 +84,7 @@ TRAINING_DOMAIN_KEYWORDS = (
 )
 # 关键词也无法判断时，机器人先追问业务范围；上下文模型提示词则用于理解“那它需要什么材料”等追问。
 DOMAIN_PROMPT = "知识库未检测到相应资料，请联系管理员添加相应资料"
-CONTEXT_ROUTER_PROMPT = """You rewrite follow-up questions for a Chinese enterprise knowledge bot.
+CONTEXT_ROUTER_PROMPT = """你负责改写企业知识库机器人收到的中文追问。
 只返回一个 JSON 对象，不要输出解释或其他内容：{"related": true或false, "domain": "product"或"training"或"unknown", "standalone_question": "改写后的完整问题"}。
 判断规则：
 1. 只有当前问题必须依赖最近对话才能理解时，related 才为 true。
@@ -132,8 +132,8 @@ def should_process(message_id: str | None) -> bool:
     # nx=True 表示“仅当键不存在才写入”，这是去重真正生效的关键。
     try:
         return bool(client.set(f"dingtalk:message:{message_id}", "1", nx=True, ex=86400))
-    except Exception:
-        logger.exception("Redis deduplication unavailable; continuing")
+    except Exception as exc:
+        _log_exception("Redis消息去重", exc)
         return True
 
 
@@ -224,6 +224,7 @@ def analyze_context_relation(question: str, history: list[dict[str, str | float]
     primary = _route_from_env("PRIMARY_LLM", fallback_name="OPENAI")
     if not primary:
         return False, "unknown", question
+    routes = _ordered_llm_routes(primary, _route_from_env("FALLBACK_LLM"))
     # 历史答案截断到 300 字，避免长回答导致上下文分流请求过大。
     compact_history = [
         {"domain": item["domain"], "question": item["question"], "answer": str(item["answer"])[:300]}
@@ -231,16 +232,20 @@ def analyze_context_relation(question: str, history: list[dict[str, str | float]
     ]
     payload = json.dumps({"recent_conversation": compact_history, "current_question": question}, ensure_ascii=False)
     # 分流模型失败时不让整个机器人崩溃，交由调用方提示员工选择资料范围。
-    try:
-        related, domain, standalone_question = _parse_context_decision(
-            _call_route(primary, payload, CONTEXT_ROUTER_PROMPT)
-        )
-        # 只有确实存在历史且模型判定为追问时才采用改写，防止独立问题被模型擅自改意。
-        related = related and bool(history)
-        return related, domain, (standalone_question or question) if related else question
-    except Exception:
-        logger.exception("Context routing analysis failed")
-        return False, "unknown", question
+    for index, route in enumerate(routes):
+        try:
+            related, domain, standalone_question = _parse_context_decision(
+                _call_route(route, payload, CONTEXT_ROUTER_PROMPT)
+            )
+            # 只有确实存在历史且模型判定为追问时才采用改写，防止独立问题被模型擅自改意。
+            related = related and bool(history)
+            return related, domain, (standalone_question or question) if related else question
+        except Exception as exc:
+            _log_exception(f"上下文判断和查询改写（{route.name}）", exc)
+            if index == 0 and len(routes) > 1 and _should_fallback(exc):
+                continue
+            return False, "unknown", question
+    return False, "unknown", question
 
 
 def require_environment() -> None:
@@ -422,6 +427,36 @@ def audit_event(event: str, **fields: object) -> None:
     logger.info(json.dumps({"event": event, **fields}, ensure_ascii=False, default=str))
 
 
+def _friendly_error(stage: str, error: Exception) -> str:
+    """Put an actionable Chinese diagnosis before the full traceback."""
+    if isinstance(error, APITimeoutError):
+        reason, advice = "接口响应超时", "检查模型服务速度或适当增加超时时间"
+    elif isinstance(error, APIConnectionError):
+        reason, advice = "无法连接模型接口", "检查网络、代理和接口地址"
+    elif isinstance(error, RateLimitError):
+        reason, advice = "模型接口限流", "降低并发、等待后重试，或切换备用线路"
+    elif isinstance(error, APIStatusError):
+        status = error.status_code
+        if status in {401, 403}:
+            reason, advice = f"模型接口鉴权失败（HTTP {status}）", "检查 API Key 和接口权限"
+        elif status == 404:
+            reason, advice = "模型接口地址或请求路径不存在（HTTP 404）", "检查 Base URL、接口协议和模型名称"
+        elif status >= 500:
+            reason, advice = f"模型服务端故障（HTTP {status}）", "稍后重试或切换备用线路"
+        else:
+            reason, advice = f"模型接口返回错误（HTTP {status}）", "检查接口配置和请求参数"
+    elif isinstance(error, (json.JSONDecodeError, ValueError)):
+        reason, advice = "返回内容或配置格式不正确", "检查模型返回格式和相关环境变量"
+    else:
+        reason, advice = "程序内部异常", "查看下面的 Python traceback 定位具体代码行"
+    return f"【{stage}失败】{reason}。建议：{advice}。错误类型：{type(error).__name__}"
+
+
+def _log_exception(stage: str, error: Exception) -> None:
+    # 首行给出中文诊断，后面仍保留 traceback，兼顾日常查看和开发排错。
+    logger.error(_friendly_error(stage, error), exc_info=True)
+
+
 def answer_question(question: str, department: str | None = None, domain: str | None = None) -> str:
     # 给简单调用方的包装函数：只需要最终文字，不需要模型线路、来源和耗时等追踪信息。
     return str(answer_question_trace(question, department, domain)["answer"])
@@ -476,9 +511,10 @@ def answer_question_trace(
             }
         # 首选线路发生可恢复故障时切换到另一条；其他异常立即结束，避免重复收费或隐藏配置错误。
         except Exception as exc:
-            errors.append(f"{route.name}: {type(exc).__name__}: {exc}")
+            errors.append(_friendly_error(f"大模型调用（{route.name}/{route.model}）", exc))
+            _log_exception(f"大模型调用（{route.name}/{route.model}）", exc)
             if index == 0 and len(routes) > 1 and _should_fallback(exc):
-                logger.warning("Selected model route failed; switching to alternate route", exc_info=True)
+                logger.warning("【模型线路切换】首选线路失败，正在尝试备用线路。")
                 continue
             break
     # 主备线路都无法返回时，给员工稳定的友好提示，并把具体错误留在日志中供管理员排查。
@@ -568,8 +604,8 @@ class KnowledgeBotHandler(ChatbotHandler):
                     self.reply_text("上一条问题正在处理中，当前问题已进入等待。", incoming)
                 try:
                     await previous_task
-                except Exception:
-                    logger.exception("Previous queued question failed; continuing with the next question")
+                except Exception as exc:
+                    _log_exception("上一条排队问题", exc)
 
             progress_done = asyncio.Event()
             progress_task = asyncio.create_task(self._send_progress_updates(incoming, progress_done))
@@ -580,8 +616,8 @@ class KnowledgeBotHandler(ChatbotHandler):
                     question, domain, route_method, incoming,
                     progress_done=progress_done, progress_task=progress_task,
                 )
-        except Exception:
-            logger.exception("Failed to process a queued DingTalk question")
+        except Exception as exc:
+            _log_exception("钉钉问题处理", exc)
             if progress_done and progress_task:
                 await self._stop_progress_updates(progress_done, progress_task)
             self.reply_text("暂时无法生成回答，请稍后重试。", incoming)
@@ -667,6 +703,7 @@ class KnowledgeBotHandler(ChatbotHandler):
         # 最终后台任务：写“收到问题”日志 → 检索和生成答案 → 写性能和答案日志 → 回复钉钉。
         sender_id = str(getattr(incoming, "sender_staff_id", None) or getattr(incoming, "sender_id", None) or "unknown")
         sender_name = str(getattr(incoming, "sender_nick", None) or "")
+        stage = "记录问题"
         try:
             # 只有上下文分析确认是追问时才传入历史；完整的新问题不携带旧回答。
             if history is None:
@@ -675,8 +712,17 @@ class KnowledgeBotHandler(ChatbotHandler):
             question_id = append_event("question_received", question=question, domain=domain, route_method=route_method, context_turns=len(history), question_length=len(question), sender_id=sender_id, sender_name=sender_name)
             _latest_question_by_sender[sender_id] = question_id
             # 检索、Embedding 和模型调用均是同步且可能很慢的操作，放进线程后不会卡住其他钉钉消息。
+            stage = "知识库检索、Embedding 和模型回答"
             result = await asyncio.to_thread(
                 answer_question_trace, question, None, domain, history, retrieval_question,
+            )
+            # 检索成功后立即保存完整材料；即使后续模型超时，管理员仍能复盘模型实际看到的内容。
+            append_retrieval(
+                question_id=question_id,
+                question=question,
+                retrieval_question=retrieval_question or question,
+                domain=domain,
+                chunks=result["sources"],
             )
             reply = str(result["answer"])
             # 只有成功回答才记入对话历史，失败提示不能成为后续追问的上下文依据。
@@ -686,6 +732,7 @@ class KnowledgeBotHandler(ChatbotHandler):
             performance = dict(result["performance"])
             performance["context_analysis_seconds"] = context_analysis_seconds
             performance["total_seconds"] = round(float(result["elapsed_seconds"]) + context_analysis_seconds, 3)
+            stage = "写入问答和性能日志"
             append_performance(
                 question=question, domain=domain, route_method=route_method,
                 initial_llm_route=result.get("initial_route"), llm_route=result["route"],
@@ -701,10 +748,12 @@ class KnowledgeBotHandler(ChatbotHandler):
                          domain=domain, route_method=route_method,
                          sender_id=sender_id, sender_name=sender_name)
         # 任意未处理异常都转换成友好回复，并额外记 error 事件，防止后台任务静默失败。
-        except Exception:
-            logger.exception("Failed to answer a DingTalk message")
+        except Exception as exc:
+            friendly_error = _friendly_error(stage, exc)
+            logger.error(friendly_error, exc_info=True)
             reply = "暂时无法生成回答，请稍后重试。"
-            append_event("question_error", question=question, error="handler_exception", sender_id=sender_id, sender_name=sender_name)
+            append_event("question_error", question=question, error=friendly_error,
+                         sender_id=sender_id, sender_name=sender_name)
 
         if progress_done and progress_task:
             await self._stop_progress_updates(progress_done, progress_task)

@@ -40,6 +40,18 @@ def performance_markdown_log_path() -> Path:
     return performance_log_path().with_suffix(".md")
 
 
+def retrieval_log_path() -> Path:
+    """Path for the full retrieved chunks sent to the model."""
+    return Path(os.getenv("RETRIEVAL_LOG_PATH", "data/retrieval_logs.jsonl").strip())
+
+
+def retrieval_markdown_log_path() -> Path:
+    configured = os.getenv("RETRIEVAL_LOG_MD_PATH", "").strip()
+    if configured:
+        return Path(configured)
+    return retrieval_log_path().with_suffix(".md")
+
+
 def _markdown_event(record: dict[str, Any]) -> str:
     # 只有“已经回答”的事件才写进简洁 Markdown；收到问题、报错等细节仍保留在 JSONL 中。
     if record.get("event") != "question_answered":
@@ -96,6 +108,7 @@ def append_performance(**fields: Any) -> str:
         f"- Embedding：{record.get('embedding_seconds', 0)} 秒",
         f"- 索引读取：{record.get('index_load_seconds', 0)} 秒",
         f"- 向量搜索：{record.get('vector_search_seconds', 0)} 秒",
+        f"- Rerank：{record.get('rerank_seconds', 0)} 秒",
         f"- 检索合计：{record.get('retrieval_seconds', 0)} 秒",
         f"- 大模型生成：{record.get('llm_generation_seconds', 0)} 秒",
         f"- 总耗时：{record.get('total_seconds', 0)} 秒",
@@ -110,6 +123,64 @@ def append_performance(**fields: Any) -> str:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         with markdown_path.open("a", encoding="utf-8") as handle:
             handle.write("\n".join(lines))
+    return record["id"]
+
+
+def append_retrieval(
+    *,
+    question_id: str,
+    question: str,
+    retrieval_question: str,
+    domain: str | None,
+    chunks: list[Any],
+) -> str:
+    """Save the exact chunk text used to build the model prompt."""
+    sources = source_summary(chunks)
+    records = []
+    for source, chunk in zip(sources, chunks):
+        records.append({**source, "content": getattr(chunk, "content", "")})
+    record = {
+        "id": uuid.uuid4().hex,
+        "event": "retrieval_context",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "question_id": question_id,
+        "question": question,
+        "retrieval_question": retrieval_question,
+        "domain": domain,
+        "chunks": records,
+    }
+    json_path = retrieval_log_path()
+    markdown_path = retrieval_markdown_log_path()
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "## 检索材料",
+        "",
+        f"- 时间：{record['created_at']}",
+        f"- 问题：{question}",
+        f"- 实际检索问题：{retrieval_question}",
+        f"- 业务域：{domain or '未指定'}",
+        f"- 材料数量：{len(records)}",
+        "",
+    ]
+    for index, chunk in enumerate(records, start=1):
+        lines.extend([
+            f"### 材料 {index}：{chunk.get('title') or '未命名资料'}",
+            "",
+            f"- 来源：{chunk.get('source_path') or chunk.get('url') or '未知'}",
+            f"- Chunk ID：{chunk.get('chunk_id') or '未知'}",
+            f"- 章节：{chunk.get('section') or '未标注'}",
+            "",
+            "正文：",
+            "",
+            str(chunk.get("content", "")),
+            "",
+        ])
+    with _lock:
+        with json_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        with markdown_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
     return record["id"]
 
 
