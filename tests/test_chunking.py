@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.parse import quote
 from unittest.mock import MagicMock, patch
 
 from chunking import estimate_tokens, split_markdown
@@ -199,6 +200,21 @@ class MarkdownChunkTests(unittest.TestCase):
                 self.assertEqual(chunk.section_title, "2.7 会计代理")
                 self.assertEqual(chunk.subsection, "2.7.4 代理记账产品")
 
+    def test_word_numbered_bold_headings_create_section_boundaries(self):
+        body = (
+            "**2.6.2** **业务办理流程**\n\n"
+            "基本户开户资料。\n\n"
+            "**2.7** **会计代理**\n\n"
+            "会计代理的含义和服务范围。" * 40
+        )
+        chunks = split_markdown("新人培养手册", body, 256, 30)
+        sections = [chunk.section for chunk in chunks]
+        self.assertTrue(any("2.6.2 业务办理流程" in section for section in sections))
+        self.assertTrue(any("2.7 会计代理" in section for section in sections))
+        for chunk in chunks:
+            if "2.6.2 业务办理流程" in chunk.section:
+                self.assertNotIn("会计代理的含义", chunk.content)
+
 
 class VaultLoadingTests(unittest.TestCase):
     @classmethod
@@ -245,6 +261,16 @@ class VaultLoadingTests(unittest.TestCase):
         all_chunks = self.knowledge.load_chunks(include_inactive=True)
         self.assertEqual({chunk.title for chunk in all_chunks}, {"有效制度", "草稿"})
 
+    def test_learning_notes_directory_is_excluded(self):
+        learning = self.notes / "学习记录" / "阶段笔记"
+        learning.mkdir(parents=True)
+        (learning / "项目学习.md").write_text("员工问答测试内容。", encoding="utf-8")
+        self.write_note("正式资料", "员工正式制度内容。")
+
+        chunks = self.knowledge.load_chunks()
+
+        self.assertEqual({chunk.title for chunk in chunks}, {"正式资料"})
+
     def test_chunk_metadata_has_parent_and_source_location_fields(self):
         source = self.write_note(
             "有来源的手册",
@@ -265,12 +291,29 @@ class VaultLoadingTests(unittest.TestCase):
             self.assertTrue(metadata["parent_id"])
             self.assertTrue(metadata["parent_content"])
 
+    def test_dingtalk_document_link_stays_with_its_authorized_note(self):
+        link = "https://alidocs.dingtalk.com/i/nodes/test-expense"
+        self.write_note("报销附件", f"---\nstatus: active\ndepartment: 财务\ndingtalk_document_url: {link}\n---\n## 申请表\n填写报销申请表。")
+        self.write_note("公开指南", "---\ndepartment: all\n---\n## 入职\n查看入职指南。")
+        finance = self.knowledge.load_chunks(department="财务")
+        for chunk in finance:
+            self.assertEqual((chunk.metadata or {}).get("dingtalk_document_url", ""), link if chunk.title == "报销附件" else "")
+            self.assertNotIn(link, chunk.content)
+        other = self.knowledge.load_chunks(department="人事")
+        self.assertNotIn("报销附件", {chunk.title for chunk in other})
+
     def test_department_filter_is_preserved(self):
         self.write_note("全员指南", "---\ndepartment: all\n---\n公司公开资料。")
         self.write_note("财务制度", "---\ndepartment: 财务\n---\n部门报销操作资料。")
         self.write_note("人事制度", "---\ndepartment: 人事\n---\n部门招聘操作资料。")
         chunks = self.knowledge.load_chunks(department="财务")
         self.assertEqual({chunk.title for chunk in chunks}, {"全员指南", "财务制度"})
+
+    def test_bm25_prefers_exact_business_term(self):
+        self.write_note("医疗器械许可", "第三类医疗器械经营许可证需要严格审核。")
+        self.write_note("普通注册", "公司注册需要准备营业执照材料。")
+        ranked = self.knowledge._bm25_search("第三类医疗器械经营许可证", 2, None, False)
+        self.assertEqual(ranked[0].title, "医疗器械许可")
 
     def test_rerank_api_reorders_candidates_and_keeps_requested_limit(self):
         chunks = [
@@ -293,6 +336,88 @@ class VaultLoadingTests(unittest.TestCase):
 
         self.assertEqual([chunk.title for chunk in ranked], ["资料二", "资料三"])
         self.assertGreaterEqual(elapsed, 0)
+
+
+class KnowledgeEditorTests(unittest.TestCase):
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.note = self.root / "制度" / "报销.md"
+        self.note.parent.mkdir()
+        self.note.write_text(
+            "---\ntitle: 旧标题\nstatus: active\ncustom: 保留\n---\n\n旧正文。\n",
+            encoding="utf-8",
+        )
+        self.env = patch.dict(
+            os.environ,
+            {
+                "OBSIDIAN_VAULT_PATH": str(self.root),
+                "OBSIDIAN_KNOWLEDGE_SUBDIR": "",
+                "CHUNK_PREVIEW_DIR": str(self.root / "preview"),
+            },
+            clear=False,
+        )
+        self.env.start()
+        self.api = importlib.import_module("api")
+        self.rebuild = patch.object(self.api, "_rebuild_index_after_ingest")
+        self.rebuild.start()
+        self.client = TestClient(self.api.app)
+
+    def tearDown(self):
+        self.rebuild.stop()
+        self.env.stop()
+        self.temp_dir.cleanup()
+
+    def test_edit_note_content_and_metadata_preserves_unknown_fields(self):
+        response = self.client.post(
+            "/knowledge-editor",
+            data={
+                "path": "制度/报销.md",
+                "title": "新版报销制度",
+                "status": "published",
+                "department": "财务",
+                "owner": "财务负责人",
+                "version": "2.0",
+                "review_date": "2027-01-01",
+                "content": "新版正文。",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        saved = self.note.read_text(encoding="utf-8")
+        self.assertIn("title: 新版报销制度", saved)
+        self.assertIn("status: published", saved)
+        self.assertIn("custom: 保留", saved)
+        self.assertIn("新版正文。", saved)
+
+    def test_editor_rejects_path_outside_knowledge_root(self):
+        response = self.client.get("/knowledge-editor?path=../outside.md")
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_web_chunking_writes_local_preview_files(self):
+        response = self.client.post(
+            "/chunk-preview",
+            data={"mode": "structure", "max_tokens": "128", "save_to_knowledge": "false"},
+            files={"file": ("上传资料.md", "# 标题\n\n这是正文。".encode("utf-8"), "text/markdown")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue((self.root / "preview" / "chunks-preview.md").is_file())
+        self.assertTrue((self.root / "preview" / "chunks.json").is_file())
+        self.assertIn("Chunk 预览已生成", response.text)
+
+    def test_knowledge_chunks_page_scans_all_notes_and_links_editor(self):
+        response = self.client.get("/knowledge-chunks")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("知识库 Chunk 总预览", response.text)
+        self.assertIn("旧正文。", response.text)
+        self.assertIn(f"/knowledge-editor?path={quote('制度/报销.md', safe='')}", response.text)
+        self.assertTrue((self.root / "preview" / "chunks-preview.md").is_file())
+        self.assertTrue((self.root / "preview" / "chunks.json").is_file())
 
 
 if __name__ == "__main__":

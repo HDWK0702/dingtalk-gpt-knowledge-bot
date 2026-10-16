@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>机器人宽版卡片 · 本地排版稿</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f4f6f9; color: #171a1d; font: 16px/1.75 "Microsoft YaHei", sans-serif; }
+  header { padding: 20px 28px; background: white; border-bottom: 1px solid #dde3eb; }
+  h1 { margin: 0 0 8px; font-size: 21px; }
+  header p { margin: 6px 0; color: #526174; }
+  fieldset { border: 0; padding: 8px 0 0; margin: 0; display: flex; gap: 10px; flex-wrap: wrap; }
+  button { padding: 7px 16px; border: 1px solid #bcc9da; border-radius: 7px; background: white; cursor: pointer; font: inherit; }
+  button[aria-pressed="true"] { color: #0759c9; background: #e7f0ff; border-color: #0759c9; }
+  main { padding: 28px; }
+  .window { width: 100%; max-width: 1480px; margin: auto; padding: 22px; background: #e9edf3; border: 1px solid #cbd5e2; border-radius: 10px; }
+  .window.mobile { max-width: 390px; padding: 12px; }
+  article { width: 100%; padding: 20px; background: #d0e0ff; border-radius: 18px; overflow-wrap: anywhere; }
+  h2 { margin: 0 0 24px; font-size: 21px; }
+  article p { margin: 0 0 18px; }
+  article p:has(strong) { margin-top: 26px; margin-bottom: 12px; }
+  article p:last-child { margin-bottom: 0; }
+  .note { max-width: 1480px; margin: 18px auto 0; color: #526174; font-size: 14px; }
+  @media(max-width: 600px) { header { padding: 16px; } main { padding: 12px; } article { padding: 16px; } }
+</style>
+<header>
+  <h1>机器人宽版卡片 · 本地排版稿</h1>
+  <p>用于审核宽版内容、编号加粗标题、分段与留白。正文来自同目录 sample 文件中的排版测试数据。</p>
+  <p>这是浏览器效果稿，蓝色用于对照已认可截图；不是钉钉客户端渲染证明，模板的实际背景和宽度以客户端为准。</p>
+  <fieldset aria-label="预览宽度">
+    <button type="button" data-mode="desktop" aria-pressed="true">桌面宽窗口</button>
+    <button type="button" data-mode="mobile" aria-pressed="false">手机窄窗口</button>
+  </fieldset>
+</header>
+<main>
+  <div class="window" id="window"><article><h2 id="title"></h2><div id="content"></div></article></div>
+  <p class="note">正式卡片保持平台原生外观；config.autoLayout 负责申请宽屏，正文组件填满可用宽度。来源仍由检索记录生成，失败时沿用文本回退。</p>
+</main>
+<script type="application/json" id="sample">{
+  "cardParamMap": {
+    "msgTitle": "企业知识库助手 · 排版测试",
+    "msgContent": "**1. 第一项：适用条件**\n\n这里展示完整段落和自动换行。正式回答仍保留检索得到的条件、例外及不确定性。\n\n**2. 第二项：处理步骤**\n\n要点之间保留空行。输入中和完成后使用同一正文变量，后备线路可以全量覆盖未完成回答。\n\n**3. 第三项：依据与限制**\n\n正式来源由现有检索代码生成。本示例没有检索资料，不提供虚构来源。\n\n**来源**\n\n仅为排版测试，无业务来源。",
+    "flowStatus": "3",
+    "config": "{\"autoLayout\": true}",
+    "autoLayout": "true"
+  }
+}</script>
+<script>
+  const sample = JSON.parse(document.getElementById('sample').textContent).cardParamMap;
+  document.getElementById('title').textContent = sample.msgTitle;
+  const content = document.getElementById('content');
+  for (const paragraph of sample.msgContent.split('\n\n')) {
+    const p = document.createElement('p');
+    if (paragraph.startsWith('**') && paragraph.endsWith('**')) {
+      const strong = document.createElement('strong');
+      strong.textContent = paragraph.slice(2, -2);
+      p.append(strong);
+    } else {
+      p.textContent = paragraph;
+    }
+    content.append(p);
+  }
+  for (const button of document.querySelectorAll('button')) {
+    button.addEventListener('click', () => {
+      document.getElementById('window').classList.toggle('mobile', button.dataset.mode === 'mobile');
+      for (const item of document.querySelectorAll('button')) item.setAttribute('aria-pressed', String(item === button));
+    });
+  }
+</script>
+</html>

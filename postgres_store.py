@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from typing import Any, Iterable
@@ -42,6 +43,10 @@ def _vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(format(float(value), ".12g") for value in vector) + "]"
 
 
+def _content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def ensure_schema(conn: Any, dimensions: int) -> None:
     if dimensions < 1:
         raise ValueError("向量维度必须大于 0。")
@@ -53,6 +58,7 @@ def ensure_schema(conn: Any, dimensions: int) -> None:
                 title TEXT NOT NULL,
                 source_url TEXT NOT NULL,
                 content TEXT NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT '',
                 source_path TEXT NOT NULL,
                 page_start TEXT NOT NULL DEFAULT '',
                 page_end TEXT NOT NULL DEFAULT '',
@@ -69,6 +75,7 @@ def ensure_schema(conn: Any, dimensions: int) -> None:
         )
         # 老数据库已经存在时，用可重复执行的迁移补上新入库标准，不删除已有 Chunk。
         for column, definition in {
+            "content_hash": "TEXT NOT NULL DEFAULT ''",
             "page_start": "TEXT NOT NULL DEFAULT ''",
             "page_end": "TEXT NOT NULL DEFAULT ''",
             "timestamp_start": "TEXT NOT NULL DEFAULT ''",
@@ -77,7 +84,7 @@ def ensure_schema(conn: Any, dimensions: int) -> None:
             "chunk_mode": "TEXT NOT NULL DEFAULT 'structure'",
         }.items():
             cursor.execute(f"ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS {column} {definition}")
-        cursor.execute("CREATE INDEX IF NOT EXISTS rag_chunks_domain_idx ON rag_chunks ((metadata->>'domain'))")
+        cursor.execute("CREATE INDEX IF NOT EXISTS rag_chunks_content_hash_idx ON rag_chunks (content_hash)")
         cursor.execute("CREATE INDEX IF NOT EXISTS rag_chunks_embedding_hnsw_idx ON rag_chunks USING hnsw (embedding vector_cosine_ops)")
         cursor.execute(
             """
@@ -107,7 +114,7 @@ def replace_index(chunks: Iterable[Any], vectors: list[list[float]], model: str,
                 metadata = dict(chunk.metadata or {})
                 rows.append((
                     str(metadata.get("chunk_id") or chunk.source_path + ":" + chunk.title),
-                    chunk.title, chunk.url, chunk.content, chunk.source_path,
+                    chunk.title, chunk.url, chunk.content, _content_hash(chunk.content), chunk.source_path,
                     str(metadata.get("page_start", "")), str(metadata.get("page_end", "")),
                     str(metadata.get("timestamp_start", "")), str(metadata.get("timestamp_end", "")),
                     str(metadata.get("parent_id", "")), str(metadata.get("chunk_mode", "structure")),
@@ -116,10 +123,10 @@ def replace_index(chunks: Iterable[Any], vectors: list[list[float]], model: str,
             cursor.executemany(
                 """
                 INSERT INTO rag_chunks
-                    (chunk_id, title, source_url, content, source_path,
+                    (chunk_id, title, source_url, content, content_hash, source_path,
                      page_start, page_end, timestamp_start, timestamp_end,
                      parent_id, chunk_mode, metadata, embedding, embedding_model)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector, %s)
                 """, rows,
             )
             cursor.execute(
@@ -137,7 +144,7 @@ def replace_index(chunks: Iterable[Any], vectors: list[list[float]], model: str,
     return len(chunk_list)
 
 
-def search(vector: list[float], limit: int, department: str | None = None, domain: str | None = None, include_inactive: bool = False, embedding_model: str | None = None) -> list[dict[str, Any]]:
+def search(vector: list[float], limit: int, department: str | None = None, include_inactive: bool = False, embedding_model: str | None = None) -> list[dict[str, Any]]:
     if limit < 1:
         return []
     conditions = []
@@ -147,9 +154,6 @@ def search(vector: list[float], limit: int, department: str | None = None, domai
     if department:
         conditions.append("LOWER(COALESCE(metadata->>'department', 'all')) IN ('all', %s)")
         params.append(department.lower())
-    if domain:
-        conditions.append("LOWER(COALESCE(metadata->>'domain', '')) = %s")
-        params.append(domain.lower())
     if embedding_model:
         conditions.append("embedding_model = %s")
         params.append(embedding_model)

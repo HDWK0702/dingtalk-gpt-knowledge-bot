@@ -17,7 +17,12 @@ if TYPE_CHECKING:
 
 
 # 索引文件格式版本。以后 JSON 结构变更时，可以用它判断旧索引是否需要重新建立。
-INDEX_FORMAT_VERSION = 1
+INDEX_FORMAT_VERSION = 2
+
+
+def content_hash(content: str) -> str:
+    """Return a stable SHA-256 fingerprint for one chunk's exact text."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def index_path() -> Path:
@@ -53,6 +58,7 @@ def _serialize(chunk: "KnowledgeChunk", vector: list[float]) -> dict[str, object
         "title": chunk.title,
         "url": chunk.url,
         "content": chunk.content,
+        "content_hash": content_hash(chunk.content),
         "source_path": chunk.source_path,
         "metadata": chunk.metadata or {},
         "vector": vector,
@@ -114,19 +120,11 @@ def search_with_metrics(
     question: str,
     limit: int = 5,
     department: str | None = None,
-    domain: str | None = None,
     include_inactive: bool = False,
 ) -> tuple[list["KnowledgeChunk"], dict[str, float]]:
     """Find the most semantically similar indexed chunks available to the user."""
     # 问答时的向量检索流程：读索引 → 把问题变成向量 → 过滤无权限资料 → 比较相似度 → 取前几条。
     from knowledge import KnowledgeChunk
-
-    # 兼容旧版调用：旧代码把 include_inactive 放在 domain 的位置，避免升级后参数错位。
-    # Keep compatibility with the pre-domain call shape:
-    # search_with_metrics(question, limit, department, include_inactive)
-    if isinstance(domain, bool) and include_inactive is False:
-        include_inactive = domain
-        domain = None
 
     # JSON 模式读取本地索引；PostgreSQL 模式直接查询数据库，不再读取 rag_index.json。
     index_load_seconds = 0.0
@@ -149,7 +147,7 @@ def search_with_metrics(
     vector_search_started = time.perf_counter()
     if _postgres_enabled():
         from postgres_store import search as postgres_search
-        rows = postgres_search(question_vector, limit, department, domain, include_inactive, configured_model)
+        rows = postgres_search(question_vector, limit, department, include_inactive, configured_model)
         chunks = [KnowledgeChunk(
             title=str(row["title"]),
             url=str(row["source_url"]),
@@ -163,7 +161,7 @@ def search_with_metrics(
             "vector_search_seconds": round(time.perf_counter() - vector_search_started, 3),
         }
 
-    # 逐条扫描索引前先做状态、部门和业务域过滤。
+    # 逐条扫描索引前先做状态和部门过滤。
     # 这样无权资料不会进入相似度比较，更不会被送给大模型。
     scored: list[tuple[float, KnowledgeChunk]] = []
     for record in payload.get("items", []):
@@ -173,9 +171,6 @@ def search_with_metrics(
             continue
         document_department = str(metadata.get("department", "all")).lower()
         if department and document_department not in {"all", department.lower()}:
-            continue
-        document_domain = str(metadata.get("domain", "")).lower()
-        if domain and document_domain != domain.lower():
             continue
         # 只处理拥有有效向量的记录，再还原为统一的 KnowledgeChunk 对象。
         vector = record.get("vector")
@@ -205,14 +200,8 @@ def search(
     question: str,
     limit: int = 5,
     department: str | None = None,
-    domain: str | None = None,
     include_inactive: bool = False,
 ) -> list["KnowledgeChunk"]:
     # 不需要性能数据的简化入口，供 FastAPI 等调用方直接取得 Chunk 列表。
-    # Keep compatibility with the pre-domain call shape:
-    # search(question, limit, department, include_inactive)
-    if isinstance(domain, bool) and include_inactive is False:
-        include_inactive = domain
-        domain = None
-    chunks, _ = search_with_metrics(question, limit, department, domain, include_inactive)
+    chunks, _ = search_with_metrics(question, limit, department, include_inactive)
     return chunks

@@ -1,4 +1,6 @@
 .env
+.env.production
+.env.test
 __pycache__/
 *.py[cod]
 .venv/
@@ -13,5 +15,6 @@ data/performance_logs.jsonl
 data/performance_logs.md
 data/*.jsonl
 data/*.md
+data/qa_exports/
 .idea/
 .vscode/

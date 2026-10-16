@@ -25,6 +25,12 @@ DEFAULT_MAX_CHARS = 1000
 DEFAULT_OVERLAP_CHARS = 120
 # 正则负责识别 Markdown 标题、代码围栏和表格行。代码块内的 # 不应被误认为标题。
 HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+# Word-to-Markdown converters often preserve numbered headings as bold text,
+# e.g. ``**2.6.2** **业务办理流程**`` instead of emitting ``###`` headings.
+NUMBERED_HEADING = re.compile(
+    r"^(?P<number>(?:\d+\.)+\d+|\d+)\s+(?P<title>.+?)\s*$"
+)
+ROMAN_SUBHEADING = re.compile(r"^[（(][一二三四五六七八九十百]+[）)]\s*(?P<title>.+?)\s*$")
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # 表格行：以 | 开头。分隔行形如 | --- | :---: |，它决定表头到此结束。
 TABLE_ROW = re.compile(r"^\s*\|.*$")
@@ -232,9 +238,9 @@ def _blocks(body: str) -> list[tuple[tuple[str, ...], str, str]]:
             flush()
             table = True
             lines.append(line)
-        elif match := HEADING.match(line):
+        elif heading := _heading_from_line(line):
             flush()
-            level, label = len(match[1]), match[2]
+            level, label = heading
             while headings and headings[-1][0] >= level:
                 headings.pop()
             headings.append((level, label))
@@ -247,6 +253,20 @@ def _blocks(body: str) -> list[tuple[tuple[str, ...], str, str]]:
     else:
         flush("fence" if fence_char else "text")
     return result
+
+
+def _heading_from_line(line: str) -> tuple[int, str] | None:
+    """Recognize normal Markdown and common Word numbered-heading output."""
+    if match := HEADING.match(line):
+        return len(match[1]), match[2]
+    # Strip emphasis markers only for heading detection; the original line is not rewritten in content.
+    normalized = re.sub(r"[*_]+", "", line).strip()
+    if match := NUMBERED_HEADING.match(normalized):
+        number = match.group("number")
+        return min(number.count(".") + 1, 6), f"{number} {match.group('title').strip()}"
+    if match := ROMAN_SUBHEADING.match(normalized):
+        return 4, match.group(0).strip()
+    return None
 
 
 def _shorten(text: str, limit: int) -> str:

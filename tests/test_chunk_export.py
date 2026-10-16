@@ -80,6 +80,7 @@ class ChunkExportTests(unittest.TestCase):
             stored = json.loads(rag.index_path().read_text(encoding="utf-8"))["items"][0]
             self.assertIn("酒店费用怎么报销", stored["content"])
             self.assertIn("住宿需提供有效发票", stored["content"])
+            self.assertEqual(stored["content_hash"], rag.content_hash(stored["content"]))
             self.assertEqual(stored["metadata"], chunks[0].metadata)
             found = rag.search("报销住宿", 5, "finance", False)
             self.assertEqual(found[0], chunks[0])

@@ -12,6 +12,8 @@ import time
 from urllib.request import Request, urlopen
 from urllib.parse import quote
 
+import bm25s
+from bm25s.tokenization import Tokenizer
 from dotenv import load_dotenv
 
 from chunking import (
@@ -28,6 +30,8 @@ from chunking import (
 # 知识库路径、Chunk 大小和检索模式来自 .env；读取后本文件可被机器人和 API 共用。
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+_bm25_cache: tuple[tuple[str, ...], object, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -49,9 +53,21 @@ def _terms(text: str) -> set[str]:
     return terms
 
 
+def _bm25_splitter(text: str) -> list[str]:
+    """Tokenize Chinese as characters/bigrams while keeping English terms intact."""
+    normalized = text.lower()
+    chinese = re.findall(r"[\u4e00-\u9fff]+", normalized)
+    tokens: list[str] = []
+    for phrase in chinese:
+        tokens.extend(phrase)
+        tokens.extend(phrase[index:index + 2] for index in range(len(phrase) - 1))
+    tokens.extend(re.findall(r"[a-z0-9]+", normalized))
+    return tokens
+
+
 def _frontmatter(content: str) -> tuple[dict[str, str], str]:
     """Read simple YAML frontmatter without requiring a YAML dependency."""
-    # Obsidian 笔记开头可写 --- 包住的元数据，例如 status、department、domain。
+    # Obsidian 笔记开头可写 --- 包住的元数据，例如 status、department。
     # 这段代码只解析最简单的“键: 值”，然后把正文与元数据分开交给后续筛选。
     if not content.startswith("---"):
         return {}, content
@@ -104,23 +120,8 @@ def _chunks(title: str, body: str, size: int = DEFAULT_MAX_CHARS,
     return [chunk.content for chunk in split_markdown(title, body, size, overlap)]
 
 
-def _domain_for_note(note: Path, vault: Path) -> str:
-    """Keep the two independent knowledge collections from mixing in search."""
-    # 还没有给每篇笔记显式写 domain 时，临时根据 Obsidian 顶级文件夹推断业务域。
-    # 例如“新人培训手册”目录下的文件默认属于 training。
-    try:
-        top_level_folder = note.relative_to(vault).parts[0]
-    except ValueError:
-        return ""
-    return {
-        "财法通": "product",
-        "新人培训手册": "training",
-    }.get(top_level_folder, "")
-
-
 def load_chunks(
     department: str | None = None,
-    domain: str | None = None,
     include_inactive: bool = False,
     *,
     max_chars: int | None = None,
@@ -155,10 +156,12 @@ def load_chunks(
     # 从目标文件夹递归找所有 Markdown 文件；按路径排序能保证每次构建索引的顺序稳定。
     results: list[KnowledgeChunk] = []
     for note in sorted(folder.rglob("*.md")):
+        if "学习记录" in note.relative_to(vault).parts:
+            continue
         # utf-8-sig 能兼容部分带 BOM 的 Windows 文件；无法识别的字符用替代符保留文件可读性。
         raw = note.read_text(encoding="utf-8-sig", errors="replace")
         metadata, content = _frontmatter(raw)
-        # 先执行发布状态、RAG 排除、部门和业务域过滤；不符合条件的内容完全不会被切分或检索。
+        # 先执行发布状态、RAG 排除和部门过滤；不符合条件的内容完全不会被切分或检索。
         if not content.strip():
             continue
         if metadata.get("exclude_from_rag", "false").lower() == "true":
@@ -166,9 +169,6 @@ def load_chunks(
         if not include_inactive and metadata.get("status", "active").lower() not in {"active", "published"}:
             continue
         if department and metadata.get("department", "all").lower() not in {"all", department.lower()}:
-            continue
-        note_domain = metadata.get("domain", "").lower() or _domain_for_note(note, vault)
-        if domain and note_domain != domain.lower():
             continue
         # Obsidian 跳转链接需要相对路径且要 URL 编码，中文文件名才能正确打开原文。
         relative = quote(note.relative_to(vault).with_suffix("").as_posix())
@@ -225,7 +225,6 @@ def load_chunks(
                 "timestamp_start": timestamp_start,
                 "timestamp_end": timestamp_end,
                 "ingested_at": metadata.get("ingested_at") or datetime.now(timezone.utc).isoformat(),
-                "domain": note_domain,
                 "chunk_id": hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24],
                 "chunk_number": str(number),
                 "chunk_count": str(len(parts)),
@@ -256,14 +255,13 @@ def _keyword_search(
     question: str,
     limit: int,
     department: str | None,
-    domain: str | None,
     include_inactive: bool,
 ) -> list[KnowledgeChunk]:
     # 没有使用 Embedding 时的本地备用检索：比较问题词片段与每个 Chunk 的词片段重合数量。
     question_terms = _terms(question)
     scored: list[tuple[int, KnowledgeChunk]] = []
-    # 先复用 load_chunks 的权限、状态和业务域过滤，再给每个可见 Chunk 打分。
-    for chunk in load_chunks(department, domain, include_inactive):
+    # 先复用 load_chunks 的状态和部门过滤，再给每个可见 Chunk 打分。
+    for chunk in load_chunks(department, include_inactive):
         score = len(question_terms & _terms(f"{chunk.title}\n{chunk.content}"))
         if question in chunk.content or question in chunk.title:
             score += 20
@@ -272,6 +270,56 @@ def _keyword_search(
     # 分数高的排在前面，只返回调用方要求的前几条。
     scored.sort(key=lambda item: item[0], reverse=True)
     return [chunk for _, chunk in scored[:limit]]
+
+
+def _bm25_search(
+    question: str,
+    limit: int,
+    department: str | None,
+    include_inactive: bool,
+) -> list[KnowledgeChunk]:
+    """Retrieve exact terms with bm25s and reuse the index while the process lives."""
+    global _bm25_cache
+    chunks = load_chunks(department, include_inactive)
+    cache_key = tuple((chunk.metadata or {}).get("chunk_id", chunk.content) for chunk in chunks)
+    if not chunks:
+        return []
+    if _bm25_cache is None or _bm25_cache[0] != cache_key:
+        tokenizer = Tokenizer(splitter=_bm25_splitter, stopwords=None)
+        corpus_tokens = tokenizer.tokenize(
+            [f"{chunk.title}\n{chunk.content}" for chunk in chunks],
+            show_progress=False,
+        )
+        retriever = bm25s.BM25()
+        retriever.index(corpus_tokens)
+        _bm25_cache = (cache_key, tokenizer, retriever)
+    _, tokenizer, retriever = _bm25_cache
+    query_tokens = tokenizer.tokenize([question], update_vocab=False, show_progress=False)
+    result_ids, scores = retriever.retrieve(query_tokens, k=min(limit, len(chunks)))
+    # BM25 can return arbitrary top rows when every score is zero. Those rows are
+    # dangerous in hybrid RAG: they look like evidence but are only coincidental.
+    return [
+        chunks[int(index)]
+        for index, score in zip(result_ids[0], scores[0], strict=True)
+        if int(index) < len(chunks) and float(score) > 0
+    ]
+
+
+def _chunk_key(chunk: KnowledgeChunk) -> str:
+    return (chunk.metadata or {}).get("chunk_id") or f"{chunk.source_path}\0{chunk.title}\0{chunk.content}"
+
+
+def _rrf_merge(result_lists: list[list[KnowledgeChunk]], limit: int) -> list[KnowledgeChunk]:
+    """Fuse BM25 and vector rankings without comparing their incompatible scores."""
+    fused: dict[str, tuple[float, int, KnowledgeChunk]] = {}
+    rank_constant = int(os.getenv("RAG_RRF_K", "60"))
+    for results in result_lists:
+        for rank, chunk in enumerate(results, start=1):
+            key = _chunk_key(chunk)
+            score, first_rank, _ = fused.get(key, (0.0, rank, chunk))
+            fused[key] = (score + 1 / (rank_constant + rank), min(first_rank, rank), chunk)
+    ranked = sorted(fused.values(), key=lambda item: (-item[0], item[1]))
+    return [chunk for _, _, chunk in ranked[:limit]]
 
 
 def _rerank_chunks(question: str, chunks: list[KnowledgeChunk], limit: int) -> tuple[list[KnowledgeChunk], float]:
@@ -320,18 +368,16 @@ def search(
     question: str,
     limit: int = 5,
     department: str | None = None,
-    domain: str | None = None,
     include_inactive: bool = False,
 ) -> list[KnowledgeChunk]:
     """Return the best matching Markdown notes from the configured Obsidian folder."""
-    return search_with_metrics(question, limit, department, domain, include_inactive)[0]
+    return search_with_metrics(question, limit, department, include_inactive)[0]
 
 
 def search_with_metrics(
     question: str,
     limit: int = 5,
     department: str | None = None,
-    domain: str | None = None,
     include_inactive: bool = False,
 ) -> tuple[list[KnowledgeChunk], dict[str, float]]:
     """Search and return stage timings for performance monitoring."""
@@ -344,9 +390,21 @@ def search_with_metrics(
     # 两种模式都保持同一份耗时字段，日志系统不需要知道当前到底使用了哪种检索方式。
     if mode == "embedding":
         from rag import search_with_metrics as semantic_search
-        chunks, metrics = semantic_search(question, candidate_limit, department, domain, include_inactive)
+        chunks, metrics = semantic_search(question, candidate_limit, department, include_inactive)
+    elif mode == "hybrid":
+        bm25_started = time.perf_counter()
+        lexical_chunks = _bm25_search(question, candidate_limit, department, include_inactive)
+        bm25_seconds = round(time.perf_counter() - bm25_started, 3)
+        from rag import search_with_metrics as semantic_search
+        semantic_chunks, metrics = semantic_search(
+            question, candidate_limit, department, include_inactive,
+        )
+        metrics["bm25_seconds"] = bm25_seconds
+        # Require at least one lexical hit before allowing semantic candidates;
+        # otherwise an unrelated embedding neighbor can become fake evidence.
+        chunks = _rrf_merge([lexical_chunks, semantic_chunks], candidate_limit) if lexical_chunks else []
     else:
-        chunks = _keyword_search(question, candidate_limit, department, domain, include_inactive)
+        chunks = _keyword_search(question, candidate_limit, department, include_inactive)
         metrics = {"index_load_seconds": 0.0, "embedding_seconds": 0.0, "vector_search_seconds": 0.0}
     chunks, metrics["rerank_seconds"] = _rerank_chunks(question, chunks, limit)
     metrics["retrieval_seconds"] = round(time.perf_counter() - started, 3)

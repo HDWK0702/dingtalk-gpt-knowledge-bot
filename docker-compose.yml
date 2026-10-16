@@ -1,8 +1,8 @@
 services:
   bot:
     build: .
-    image: dingtalk-gpt-knowledge-bot:local
-    env_file: .env
+    image: ${BOT_IMAGE:-dingtalk-gpt-knowledge-bot:local}
+    env_file: ${COMPOSE_ENV_FILE:?Set COMPOSE_ENV_FILE to .env.production or .env.test}
     environment:
       # Container paths deliberately differ from the host Windows paths in .env.
       OBSIDIAN_VAULT_PATH: /data/knowledge
@@ -10,6 +10,7 @@ services:
       QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
       RETRIEVAL_LOG_PATH: /app/data/logs/retrieval_logs.jsonl
       RETRIEVAL_LOG_MD_PATH: /app/data/logs/retrieval_logs.md
+      CHUNK_PREVIEW_DIR: /app/data/chunks-preview
       RAG_STORAGE: ${RAG_STORAGE:-postgres}
       # Containers reach PostgreSQL through its Docker service name, not Windows localhost.
       DATABASE_URL: postgresql://${POSTGRES_USER:-knowledge}:${POSTGRES_PASSWORD:-change_me_local_only}@postgres:5432/${POSTGRES_DB:-knowledge}
@@ -25,22 +26,24 @@ services:
         condition: service_healthy
   api:
     build: .
-    image: dingtalk-gpt-knowledge-bot:local
+    image: ${BOT_IMAGE:-dingtalk-gpt-knowledge-bot:local}
     command: uvicorn api:app --host 0.0.0.0 --port 8000
-    env_file: .env
+    env_file: ${COMPOSE_ENV_FILE:?Set COMPOSE_ENV_FILE to .env.production or .env.test}
     environment:
       OBSIDIAN_VAULT_PATH: /data/knowledge
       RAG_INDEX_PATH: /app/data/rag/rag_index.json
       QA_LOG_PATH: /app/data/logs/qa_logs.jsonl
       RETRIEVAL_LOG_PATH: /app/data/logs/retrieval_logs.jsonl
       RETRIEVAL_LOG_MD_PATH: /app/data/logs/retrieval_logs.md
+      CHUNK_PREVIEW_DIR: /app/data/chunks-preview
       RAG_STORAGE: ${RAG_STORAGE:-postgres}
       DATABASE_URL: postgresql://${POSTGRES_USER:-knowledge}:${POSTGRES_PASSWORD:-change_me_local_only}@postgres:5432/${POSTGRES_DB:-knowledge}
     restart: unless-stopped
     volumes:
-      - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:ro
+      - ${KNOWLEDGE_PATH:-${OBSIDIAN_VAULT_PATH:-./demo/knowledge}}:/data/knowledge:rw
       - rag_data:/app/data/rag
       - app_data:/app/data/logs
+      - ${CHUNK_PREVIEW_HOST_PATH:-./data/chunks-preview}:/app/data/chunks-preview
     ports:
       - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8000}:8000"
     depends_on:
@@ -50,9 +53,9 @@ services:
         condition: service_healthy
   indexer:
     build: .
-    image: dingtalk-gpt-knowledge-bot:local
+    image: ${BOT_IMAGE:-dingtalk-gpt-knowledge-bot:local}
     command: python index_knowledge.py
-    env_file: .env
+    env_file: ${COMPOSE_ENV_FILE:?Set COMPOSE_ENV_FILE to .env.production or .env.test}
     environment:
       OBSIDIAN_VAULT_PATH: /data/knowledge
       RAG_INDEX_PATH: /app/data/rag/rag_index.json

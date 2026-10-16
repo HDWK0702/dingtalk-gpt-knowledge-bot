@@ -60,10 +60,13 @@ def _markdown_event(record: dict[str, Any]) -> str:
     sources = record.get("sources")
     first_source = sources[0] if isinstance(sources, list) and sources else {}
     first_title = first_source.get("title", "未检索到资料") if isinstance(first_source, dict) else str(first_source)
+    if record.get("mode") == "chat":
+        first_title = "普通 AI 对话（未使用知识库）"
     route = record.get("llm_route") or "未调用模型"
     return "\n".join([
         "## 问答记录",
         "",
+        f"- Trace ID：{record.get('trace_id', '')}",
         f"- 提问人员：{record.get('sender_name') or record.get('sender_id') or '未知'}",
         f"- 提问问题：{record.get('question', '')}",
         f"- 调用线路：{route}",
@@ -102,10 +105,11 @@ def append_performance(**fields: Any) -> str:
         "## 性能记录",
         "",
         f"- 时间：{record['created_at']}",
+        f"- Trace ID：{record.get('trace_id', '')}",
         f"- 问题：{record.get('question', '')}",
-        f"- 资料范围：{record.get('domain', '')}",
         f"- 上下文分析：{record.get('context_analysis_seconds', 0)} 秒",
         f"- Embedding：{record.get('embedding_seconds', 0)} 秒",
+        f"- BM25：{record.get('bm25_seconds', 0)} 秒",
         f"- 索引读取：{record.get('index_load_seconds', 0)} 秒",
         f"- 向量搜索：{record.get('vector_search_seconds', 0)} 秒",
         f"- Rerank：{record.get('rerank_seconds', 0)} 秒",
@@ -114,7 +118,10 @@ def append_performance(**fields: Any) -> str:
         f"- 总耗时：{record.get('total_seconds', 0)} 秒",
         f"- 初始模型线路：{record.get('initial_llm_route', '')}",
         f"- 最终模型线路：{record.get('llm_route', '')}",
+        f"- 模型调用是否成功：{'是' if record.get('llm_success') else '否'}",
+        f"- 模型调用状态：{record.get('llm_status', 'unknown')}",
         f"- 是否故障切换：{'是' if record.get('failover_used') else '否'}",
+        f"- 各线路尝试：{_format_llm_attempts(record.get('llm_attempts', []))}",
         "",
     ]
     # 与问答日志共用锁，防止并发任务的性能记录互相穿插。
@@ -126,13 +133,25 @@ def append_performance(**fields: Any) -> str:
     return record["id"]
 
 
+def _format_llm_attempts(attempts: Any) -> str:
+    if not isinstance(attempts, list) or not attempts:
+        return "未调用"
+    items = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        result = "成功" if attempt.get("success") else "失败"
+        items.append(f"{attempt.get('route', '未知')}={result}({attempt.get('seconds', 0)}秒)")
+    return "；".join(items) or "未调用"
+
+
 def append_retrieval(
     *,
     question_id: str,
     question: str,
     retrieval_question: str,
-    domain: str | None,
     chunks: list[Any],
+    trace_id: str = "",
 ) -> str:
     """Save the exact chunk text used to build the model prompt."""
     sources = source_summary(chunks)
@@ -143,10 +162,10 @@ def append_retrieval(
         "id": uuid.uuid4().hex,
         "event": "retrieval_context",
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "trace_id": trace_id,
         "question_id": question_id,
         "question": question,
         "retrieval_question": retrieval_question,
-        "domain": domain,
         "chunks": records,
     }
     json_path = retrieval_log_path()
@@ -157,9 +176,9 @@ def append_retrieval(
         "## 检索材料",
         "",
         f"- 时间：{record['created_at']}",
+        f"- Trace ID：{record['trace_id']}",
         f"- 问题：{question}",
         f"- 实际检索问题：{retrieval_question}",
-        f"- 业务域：{domain or '未指定'}",
         f"- 材料数量：{len(records)}",
         "",
     ]
