@@ -1,6 +1,7 @@
 .env
 .env.production
 .env.test
+/HANDOFF.md
 __pycache__/
 *.py[cod]
 .venv/
