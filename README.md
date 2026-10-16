@@ -385,3 +385,7 @@ Do not put either the DingTalk App Secret or OpenAI API key in source control.
 
 - OpenAI text generation: https://developers.openai.com/api/docs/guides/text
 - DingTalk enterprise knowledge Q&A agent: https://open.dingtalk.com/document/development/enterprise-knowledge-qa-agent
+
+## 致谢
+
+感谢 [DingTalk Workspace CLI（DWS）](https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli) 项目及其贡献者。DWS 提供面向开发者和 AI Agent 的钉钉命令行工具，为本项目开发过程中的钉钉能力查询、应用配置核对和卡片调试提供了支持。
